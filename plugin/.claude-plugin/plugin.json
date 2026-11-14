@@ -1,10 +1,17 @@
 {
   "name": "cost-guard",
   "displayName": "Cost Guard",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Alerts and hard stops on Claude Code spend per session and per day, a warning before resuming an idle session whose prompt cache expired, and advice on what in the context to drop. No admin rights needed.",
-  "author": { "name": "dimohamdy" },
-  "keywords": ["cost", "budget", "spend", "limits"],
+  "author": {
+    "name": "dimohamdy"
+  },
+  "keywords": [
+    "cost",
+    "budget",
+    "spend",
+    "limits"
+  ],
   "userConfig": {
     "session_cap_usd": {
       "type": "number",
@@ -45,6 +52,13 @@
       "description": "When the context passes this many thousand tokens, show once what fills it and how to shrink it.",
       "default": 150,
       "min": 20
+    },
+    "insights_every_days": {
+      "type": "number",
+      "title": "Cost tips every (days)",
+      "description": "At session start, show the top 3 ways to cut cost found in your last 14 days (unused plugins, skills, MCP servers, chatty hooks). 0 turns this off.",
+      "default": 1,
+      "min": 0
     }
   }
 }

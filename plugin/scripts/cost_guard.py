@@ -43,6 +43,8 @@ DEFAULT_CONFIG = {
     "cold_cache_warn_usd": 1.0,  # block once when an idle session would re-cache more than this
     "override_word": "#override",  # put this in a prompt to continue past a cap or cold-cache stop
     "context_warn_k": 150,  # one-time advice when the context passes this many thousand tokens
+    "insights_every_days": 1,  # cost tips at session start at most this often; 0 turns them off
+    "insights_ignore": "",  # comma-separated plugin, skill, server or hook names to never suggest
     # Tools a cap never denies: they cost nothing and keep the app's task list and wrap-up working.
     "never_block": ["mcp__ccd_", "TodoWrite", "TaskCreate", "TaskUpdate", "TaskList", "TaskGet",
                     "ExitPlanMode", "AskUserQuestion"],
@@ -87,6 +89,8 @@ LIMIT_KEYS = {  # plugin option / override key -> type
     "cold_cache_warn_usd": float,
     "override_word": str,
     "context_warn_k": float,
+    "insights_every_days": float,
+    "insights_ignore": str,  # comma-separated
 }
 
 
@@ -943,24 +947,21 @@ def skill_source(name):
     return "built-in", None
 
 
-def run_insights(days):
-    cfg = load_config()
+def build_insights(cfg, days):
+    """Returns None when there is no data, else a dict with "header", "table" (lines)
+    and "recs": [(usd, key, text)] sorted best first. Items in insights_ignore are left out."""
     d = scan_period(days)
     msgs = d["messages"]
     if not msgs:
-        print(f"No Claude Code messages in the last {days} day(s).")
-        return
+        return None
     model = max(d["models"], key=d["models"].get)
     p_in, _, p_read = price_for(model, cfg)
+    ignore = {x.strip().lower() for x in str(cfg.get("insights_ignore", "")).split(",") if x.strip()}
 
     def burn(tokens_per_msg):  # re-read by every message, re-written at each start/compaction
         return tokens_per_msg * (msgs * p_read + d["rewrites"] * p_in * 1.25) / 1e6
 
     uses = d["skill_uses"]
-    print(f"Last {days} day(s): {msgs:,} messages in {d['sessions']} sessions, mostly {model}.")
-    print("Costs below are what each item adds by being sent with every message (rough).\n")
-
-    # Skills grouped by where they come from.
     plugins, personal = {}, []
     for name, t in d["listing"].items():
         kind, where = skill_source(name)
@@ -971,32 +972,28 @@ def run_insights(days):
             g["used"] += uses.get(name, 0)
         elif kind == "personal":
             personal.append((t, name, uses.get(name, 0), where))
-
-    rows = []
-    for plugin, g in plugins.items():
-        rows.append((burn(g["tokens"]), f"plugin {plugin} ({g['skills']} skills)", g["tokens"], g["used"]))
-    for t, name, n, _ in personal:
-        rows.append((burn(t), f"skill {name} (personal)", t, n))
     by_server = {}
     for tool in (d["shape"] or {}).get("tools") or []:
         srv = server_of(tool.get("name", "")) if isinstance(tool, dict) else None
         if srv:
             by_server[srv] = by_server.get(srv, 0) + toks(tool)
-    for srv, t in by_server.items():
-        rows.append((burn(t), f"MCP {srv}", t, d["mcp_uses"].get(srv, 0)))
-    rows.sort(reverse=True)
-    print(f"  {'Sent with every message':<46} {'tokens':>7} {'uses':>6} {'≈cost':>9}")
-    for usd, label, t, n in rows[:20]:
-        print(f"  {label[:46]:<46} {k(t):>7} {n:>6} {fmt(usd):>9}")
 
+    table = []
+    rows = [(burn(g["tokens"]), f"plugin {p} ({g['skills']} skills)", g["tokens"], g["used"])
+            for p, g in plugins.items()]
+    rows += [(burn(t), f"skill {name} (personal)", t, n) for t, name, n, _ in personal]
+    rows += [(burn(t), f"MCP {srv}", t, d["mcp_uses"].get(srv, 0)) for srv, t in by_server.items()]
+    rows.sort(reverse=True)
+    table.append(f"  {'Sent with every message':<46} {'tokens':>7} {'uses':>6} {'≈cost':>9}")
+    for usd, label, t, n in rows[:20]:
+        table.append(f"  {label[:46]:<46} {k(t):>7} {n:>6} {fmt(usd):>9}")
     hooks = sorted(((tm * p_read / 1e6 + tot * p_in * 1.25 / 1e6, label, tot)
                     for label, (tot, tm) in d["hook_burn"].items()), reverse=True)
     if hooks:
-        print(f"\n  {'Hook text added to the context':<46} {'total':>7} {'':>6} {'≈cost':>9}")
+        table.append(f"\n  {'Hook text added to the context':<46} {'total':>7} {'':>6} {'≈cost':>9}")
         for usd, label, tot in hooks[:6]:
-            print(f"  {label[:46]:<46} {k(tot):>7} {'':>6} {fmt(usd):>9}")
+            table.append(f"  {label[:46]:<46} {k(tot):>7} {'':>6} {fmt(usd):>9}")
 
-    print("\nWhat to remove or change, biggest saving first:")
     recs = []
     for plugin, g in plugins.items():
         if g["used"]:
@@ -1004,23 +1001,23 @@ def run_insights(days):
         also = [s for s in d["mcp_uses"] if s.startswith(f"plugin_{plugin}_")]
         note = (f" It also provides an MCP server you used ({', '.join(also)}); "
                 f"disabling removes that too.") if also else ""
-        recs.append((burn(g["tokens"]), (
+        recs.append((burn(g["tokens"]), plugin, (
             f"Disable plugin {plugin}: none of its {g['skills']} skills was used, and its "
             f"skill list costs ≈{k(g['tokens'])} per message (≈{fmt(burn(g['tokens']))} in {days} "
             f"days). Run /plugin, then disable it; re-enable any time.{note}")))
     for t, name, n, folder in personal:
         if n == 0:
-            recs.append((burn(t), (
+            recs.append((burn(t), name, (
                 f"Remove personal skill {name}: never used, ≈{k(t)} per message "
                 f"(≈{fmt(burn(t))}). Reversible: mkdir -p ~/.claude/skills-off && "
                 f"mv {folder} ~/.claude/skills-off/")))
         elif t >= 150:
-            recs.append((burn(t - 60), (
+            recs.append((burn(t - 60), name, (
                 f"Shorten the description of skill {name}: ≈{k(t)} per message. One or two "
                 f"sentences of 'use when …' is enough (edit {folder}/SKILL.md).")))
     for srv, t in by_server.items():
         if not srv.startswith(APP_SERVERS) and t >= 300 and not d["mcp_uses"].get(srv):
-            recs.append((burn(t), (
+            recs.append((burn(t), srv, (
                 f"Turn off MCP server {srv}: never called, ≈{k(t)} of tool definitions per "
                 f"message (≈{fmt(burn(t))}). Use /mcp, or the app's connector settings.")))
     for name, body in d["skill_bodies"].items():
@@ -1030,19 +1027,60 @@ def run_insights(days):
             fix = (f"move its reference sections into separate files in {where} that the "
                    f"skill reads only when needed") if kind == "personal" else \
                 "check that it only triggers when you really need it"
-            recs.append((body * n * p_in * 1.25 / 1e6, (
+            recs.append((body * n * p_in * 1.25 / 1e6, name, (
                 f"Skill {name} loads ≈{k(body)} into the context each time it runs ({n}x). "
                 f"To make it cheaper, {fix}.")))
     for usd, label, tot in hooks[:3]:
         if usd >= 0.5:
-            recs.append((usd, (
+            recs.append((usd, label, (
                 f"Hook '{label}' added ≈{k(tot)} of text in total (≈{fmt(usd)}). If you don't "
                 f"need what it injects, disable its plugin or remove it from ~/.claude/settings.json.")))
-    recs.sort(reverse=True)
-    if not recs:
+    recs = [r for r in recs if not any(i in r[1].lower() for i in ignore)]
+    recs.sort(key=lambda r: r[0], reverse=True)
+    header = (f"Last {days} day(s): {msgs:,} messages in {d['sessions']} sessions, mostly {model}.")
+    return {"header": header, "table": table, "recs": recs}
+
+
+def run_insights(days):
+    cfg = load_config()
+    ins = build_insights(cfg, days)
+    if not ins:
+        print(f"No Claude Code messages in the last {days} day(s).")
+        return
+    print(ins["header"])
+    print("Costs below are what each item adds by being sent with every message (rough).\n")
+    print("\n".join(ins["table"]))
+    print("\nWhat to remove or change, biggest saving first:")
+    if not ins["recs"]:
         print("  Nothing stands out: everything sent with each message gets used.")
-    for i, (_, text) in enumerate(recs[:10], 1):
+    for i, (_, _, text) in enumerate(ins["recs"][:10], 1):
         print(f"  {i}. {text}")
+    print("\nTo stop a tip from coming back: /cost-guard:limits ignore <name>[,<name>…]")
+
+
+def insights_tip(cfg, data):
+    """SessionStart: the top cost tips from recent sessions, at most every N days."""
+    every = cfg.get("insights_every_days", 1)
+    if every <= 0 or data.get("source") not in (None, "startup"):
+        return None
+    path = os.path.join(STATE_DIR, "insights.json")
+    st = load_json(path, {})
+    last = st.get("shown")
+    if last and (time.time() - last) < every * 86400 - 3600:
+        return None
+    ins = build_insights(cfg, 14)
+    st["shown"] = time.time()
+    save_json(path, st)
+    if not ins or not ins["recs"]:
+        return None
+    top = ins["recs"][:3]
+    total = sum(r[0] for r in top)
+    lines = [f"cost-guard tips: {len(top)} change(s) could save ≈{fmt(total)} per 2 weeks "
+             f"(based on your last 14 days):"]
+    lines += [f"{i}. {text}" for i, (_, _, text) in enumerate(top, 1)]
+    lines.append("Full list: /cost-guard:insights · hide a tip: /cost-guard:limits ignore <name> "
+                 "· turn these tips off: /cost-guard:limits tips 0")
+    return "\n".join(lines)
 
 
 # ---------- limits, sync, status line setup ----------
@@ -1054,7 +1092,10 @@ def run_limits(args):
         save_json(OVERRIDES_PATH, overrides)
         print("Overrides cleared; using the plugin options.")
     elif len(args) >= 2:
-        key, val = args[0], ",".join(args[1:]) if args[0] == "warn_at_usd" else args[1]
+        key, val = args[0], ",".join(args[1:]) if args[0] in ("warn_at_usd", "insights_ignore") else args[1]
+        if key == "insights_ignore":  # add to the list instead of replacing it
+            names = [x.strip() for x in f"{overrides.get(key, '')},{val}".split(",") if x.strip()]
+            val = ",".join(dict.fromkeys(names))
         if key not in LIMIT_KEYS:
             sys.exit(f"Unknown limit {key!r}. Use one of: {', '.join(LIMIT_KEYS)}")
         probe = {}
@@ -1074,6 +1115,9 @@ def run_limits(args):
         ("cold_cache_warn_usd", fmt(cfg["cold_cache_warn_usd"]), "stop once before an expensive re-cache"),
         ("override_word", cfg["override_word"], "type this to continue past a stop"),
         ("context_warn_k", f"{cfg['context_warn_k']:g}k tokens", "one-time context advice"),
+        ("insights_every_days", f"{cfg['insights_every_days']:g} day(s)" if cfg["insights_every_days"] > 0
+         else "off", "cost tips at session start"),
+        ("insights_ignore", cfg["insights_ignore"] or "none", "never suggest these"),
     ]
     for key, val, what in rows:
         src = "override" if key in overrides else "plugin option" if key in session else "default"
@@ -1081,13 +1125,22 @@ def run_limits(args):
 
 
 def run_sync():
-    """SessionStart: keep a copy of this script in the data folder for the status line."""
+    """SessionStart: keep a copy of this script in the data folder for the status line,
+    and show the top cost tips from recent sessions (at most every insights_every_days)."""
+    data = load_json_stdin()
     plugin_options()
     src = os.path.abspath(__file__)
     dst = os.path.join(DATA, "cost_guard.py")
     if src != dst:
         os.makedirs(DATA, exist_ok=True)
         shutil.copy2(src, dst)
+    try:
+        tip = insights_tip(load_config(), data)
+    except Exception:
+        log_error("insights_tip")
+        tip = None
+    if tip:
+        print(json.dumps({"systemMessage": tip}))
 
 
 def run_install_statusline(force):

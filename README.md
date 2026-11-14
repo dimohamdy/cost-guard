@@ -9,6 +9,7 @@ so no admin rights are needed.
 | Session passes **$100** | New prompts are **blocked**, and tool calls are **denied mid-turn**, so a long autonomous run also stops |
 | This machine passes **$150 today** (all sessions) | Same block |
 | You come back to an idle session with a big context | Blocked **once** with the cost of re-caching it ("idle 22 h, re-caches 612k tokens ≈ $4.90"). Re-send to continue, or `/clear` |
+| You start a session (once a day) | The top 3 cost cuts from your last 14 days, such as unused plugins, skills, MCP servers or chatty hooks, with the exact fix for each |
 | Context passes **150k tokens** | A one-time note on what fills it and what to drop (see below) |
 | Status line (optional) | `Opus 5.5 · session $12.34 · today $40.10 · ctx 612k · cache cold` |
 
@@ -18,7 +19,13 @@ change that list with `"never_block": [...]` in `overrides.json`.
 
 ## What burns tokens without being used
 
-`/cost-guard:insights [days]` (14 days by default) reads every recent transcript and lists
+The plugin checks this on its own. At the start of a session, once a day, it shows the top 3
+items with the fix for each. To change how often: `/cost-guard:limits tips 7` (weekly) or
+`tips 0` (off). To stop a suggestion you want to keep, such as a plugin you rely on:
+`/cost-guard:limits ignore claude-mem`. The name can be any part of a plugin, skill,
+server or hook name.
+
+For the full list, run `/cost-guard:insights [days]` (14 days by default). It reads every recent transcript and lists
 what goes out with **every** message, with how often it was used and roughly what it cost:
 
 - **Plugins whose skills were never used.** The skill list is sent with each message,
