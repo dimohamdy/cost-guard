@@ -16,6 +16,24 @@ To get past a stop, put `#override` in your message. That adds one more cap-size
 The plugin never blocks the app's own bookkeeping tools (task list, wrap-up, plan mode). You can
 change that list with `"never_block": [...]` in `overrides.json`.
 
+## What burns tokens without being used
+
+`/cost-guard:insights [days]` (14 days by default) reads every recent transcript and lists
+what goes out with **every** message, with how often it was used and roughly what it cost:
+
+- **Plugins whose skills were never used.** The skill list is sent with each message,
+  so disable the plugin with `/plugin`. The report warns you when the plugin also
+  provides an MCP server or hooks that you do use.
+- **Personal skills** (`~/.claude/skills`) that were never used. You get a reversible
+  command that moves the skill to `~/.claude/skills-off/`. For long descriptions,
+  the advice is to shorten them.
+- **MCP servers that were never called.** Their tool definitions are sent with every message.
+- **Skills with large bodies that run often.** For your own skills, the advice is to
+  move reference material into separate files that the skill reads only when needed.
+- **Hooks that inject text** at session start or on tool calls, totaled across sessions.
+
+It is an estimate. It uses the newest session's skill list and tool set as the baseline.
+
 ## Context advice
 
 Run `/cost-guard:context` at any time. Each alert and stop also includes the top two points.
@@ -96,6 +114,6 @@ $214 (89%) was cache writes.
 .claude-plugin/marketplace.json   marketplace "team-cost-tools"
 plugin/.claude-plugin/plugin.json manifest and the limit options
 plugin/hooks/hooks.json           SessionStart, UserPromptSubmit, PreToolUse
-plugin/commands/                  /cost-guard:limits, :report, :context, :statusline
+plugin/commands/                  /cost-guard:limits, :report, :context, :insights, :statusline
 plugin/scripts/cost_guard.py      all logic (Python 3, standard library only)
 ```

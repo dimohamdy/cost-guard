@@ -409,7 +409,12 @@ def hook_label(a):
         return m.group(1)
     cmd = " ".join(cmd.replace('"', "").replace("${CLAUDE_PLUGIN_ROOT}/", "").split())
     event = (a.get("hookName") or a.get("hookEvent") or "hook").split(":")[0]
-    return f"{event}: {cmd[:40]}" if cmd else event
+    if cmd:
+        return f"{event}: {cmd[:40]}"
+    text = a.get("content") or ""  # no command recorded: name it by what it says
+    text = " ".join(text) if isinstance(text, list) else str(text)
+    words = " ".join(re.sub(r"\x1b?\[[0-9;]*m|<[^>]+>|[*#`]", " ", text).split())
+    return f'{event}: "{words[:32]}…"' if words else event
 
 
 def hook_tokens(a):
@@ -844,6 +849,202 @@ def run_context(session_id):
     print("\nSavings are rough: 100 more messages re-reading the tokens, plus one cold re-cache.")
 
 
+# ---------- insights across sessions ----------
+
+PERSONAL_SKILLS = os.path.expanduser("~/.claude/skills")
+COMMAND_NAME = re.compile(r"<command-name>/?([^<\s]+)</command-name>")
+
+
+def scan_period(days):
+    """One pass over the last `days` of main transcripts. Collects what is sent with
+    every message (skill list, tool definitions), what hooks add, and what gets used."""
+    cutoff = time.time() - days * 86400
+    out = {"messages": 0, "sessions": 0, "rewrites": 0, "models": {}, "skill_uses": {},
+           "mcp_uses": {}, "skill_bodies": {}, "hook_burn": {}, "listing": {}, "shape": None}
+    newest_listing = newest_shape = 0
+    paths = [p for p in glob.glob(os.path.join(PROJECTS, "*", "*.jsonl"))
+             if os.path.getmtime(p) >= cutoff]
+    markers = (b'"usage"', b'"attachment"', b"compact_boundary", b"<command-name>", b'"Skill"',
+               b"api-request-shape", b"mcp__")
+    for p in paths:
+        mtime = os.path.getmtime(p)
+        seen, live_hooks, listing = set(), {}, {}
+        out["sessions"] += 1
+        out["rewrites"] += 1
+        with open(p, "rb") as f:
+            for raw in f:
+                if not any(m in raw for m in markers):
+                    continue
+                try:
+                    e = json.loads(raw)
+                except Exception:
+                    continue
+                kind = e.get("type")
+                msg = e.get("message") or {}
+                content = msg.get("content")
+                if kind == "assistant" and msg.get("usage") and msg.get("id") not in seen:
+                    seen.add(msg.get("id"))
+                    out["messages"] += 1
+                    m = msg.get("model") or "?"
+                    out["models"][m] = out["models"].get(m, 0) + 1
+                    for label, n in live_hooks.items():  # hook text re-read by this message
+                        out["hook_burn"].setdefault(label, [0, 0])[1] += n
+                if kind == "assistant" and isinstance(content, list):
+                    for b in content:
+                        if not isinstance(b, dict) or b.get("type") != "tool_use":
+                            continue
+                        name = b.get("name", "")
+                        if name == "Skill":
+                            s = str((b.get("input") or {}).get("skill", ""))
+                            out["skill_uses"][s] = out["skill_uses"].get(s, 0) + 1
+                        srv = server_of(name)
+                        if srv:
+                            out["mcp_uses"][srv] = out["mcp_uses"].get(srv, 0) + 1
+                elif kind == "user":
+                    text = content if isinstance(content, str) else json.dumps(content or "")
+                    for name in COMMAND_NAME.findall(text):
+                        out["skill_uses"][name] = out["skill_uses"].get(name, 0) + 1
+                elif kind == "system" and e.get("subtype") == "compact_boundary":
+                    out["rewrites"] += 1
+                    live_hooks = {}
+                elif kind == "api-request-shape" and mtime >= newest_shape:
+                    newest_shape, out["shape"] = mtime, e.get("shape")
+                elif kind == "attachment":
+                    a = e.get("attachment") or {}
+                    atype = a.get("type")
+                    if atype == "skill_listing":
+                        for line in (a.get("content") or "").splitlines():
+                            if line.startswith("- "):
+                                listing[line[2:].split(": ", 1)[0]] = toks(line)
+                    elif atype == "invoked_skills":
+                        for s in a.get("skills") or []:
+                            if isinstance(s, dict):
+                                n = toks(s.get("content") or "")
+                                name = s.get("name", "?")
+                                out["skill_bodies"][name] = max(out["skill_bodies"].get(name, 0), n)
+                    elif ATTACHMENT_GROUPS.get(atype) == "hooks":
+                        n = hook_tokens(a)
+                        if n:
+                            label = hook_label(a)
+                            out["hook_burn"].setdefault(label, [0, 0])[0] += n
+                            live_hooks[label] = live_hooks.get(label, 0) + n
+        if listing and mtime >= newest_listing:
+            newest_listing, out["listing"] = mtime, listing
+    return out
+
+
+def skill_source(name):
+    """("plugin", plugin) | ("personal", folder) | ("built-in", None)"""
+    if ":" in name:
+        return "plugin", name.split(":", 1)[0]
+    folder = os.path.join(PERSONAL_SKILLS, name)
+    if os.path.isdir(folder):
+        return "personal", folder
+    return "built-in", None
+
+
+def run_insights(days):
+    cfg = load_config()
+    d = scan_period(days)
+    msgs = d["messages"]
+    if not msgs:
+        print(f"No Claude Code messages in the last {days} day(s).")
+        return
+    model = max(d["models"], key=d["models"].get)
+    p_in, _, p_read = price_for(model, cfg)
+
+    def burn(tokens_per_msg):  # re-read by every message, re-written at each start/compaction
+        return tokens_per_msg * (msgs * p_read + d["rewrites"] * p_in * 1.25) / 1e6
+
+    uses = d["skill_uses"]
+    print(f"Last {days} day(s): {msgs:,} messages in {d['sessions']} sessions, mostly {model}.")
+    print("Costs below are what each item adds by being sent with every message (rough).\n")
+
+    # Skills grouped by where they come from.
+    plugins, personal = {}, []
+    for name, t in d["listing"].items():
+        kind, where = skill_source(name)
+        if kind == "plugin":
+            g = plugins.setdefault(where, {"tokens": 0, "skills": 0, "used": 0})
+            g["tokens"] += t
+            g["skills"] += 1
+            g["used"] += uses.get(name, 0)
+        elif kind == "personal":
+            personal.append((t, name, uses.get(name, 0), where))
+
+    rows = []
+    for plugin, g in plugins.items():
+        rows.append((burn(g["tokens"]), f"plugin {plugin} ({g['skills']} skills)", g["tokens"], g["used"]))
+    for t, name, n, _ in personal:
+        rows.append((burn(t), f"skill {name} (personal)", t, n))
+    by_server = {}
+    for tool in (d["shape"] or {}).get("tools") or []:
+        srv = server_of(tool.get("name", "")) if isinstance(tool, dict) else None
+        if srv:
+            by_server[srv] = by_server.get(srv, 0) + toks(tool)
+    for srv, t in by_server.items():
+        rows.append((burn(t), f"MCP {srv}", t, d["mcp_uses"].get(srv, 0)))
+    rows.sort(reverse=True)
+    print(f"  {'Sent with every message':<46} {'tokens':>7} {'uses':>6} {'≈cost':>9}")
+    for usd, label, t, n in rows[:20]:
+        print(f"  {label[:46]:<46} {k(t):>7} {n:>6} {fmt(usd):>9}")
+
+    hooks = sorted(((tm * p_read / 1e6 + tot * p_in * 1.25 / 1e6, label, tot)
+                    for label, (tot, tm) in d["hook_burn"].items()), reverse=True)
+    if hooks:
+        print(f"\n  {'Hook text added to the context':<46} {'total':>7} {'':>6} {'≈cost':>9}")
+        for usd, label, tot in hooks[:6]:
+            print(f"  {label[:46]:<46} {k(tot):>7} {'':>6} {fmt(usd):>9}")
+
+    print("\nWhat to remove or change, biggest saving first:")
+    recs = []
+    for plugin, g in plugins.items():
+        if g["used"]:
+            continue
+        also = [s for s in d["mcp_uses"] if s.startswith(f"plugin_{plugin}_")]
+        note = (f" It also provides an MCP server you used ({', '.join(also)}); "
+                f"disabling removes that too.") if also else ""
+        recs.append((burn(g["tokens"]), (
+            f"Disable plugin {plugin}: none of its {g['skills']} skills was used, and its "
+            f"skill list costs ≈{k(g['tokens'])} per message (≈{fmt(burn(g['tokens']))} in {days} "
+            f"days). Run /plugin, then disable it; re-enable any time.{note}")))
+    for t, name, n, folder in personal:
+        if n == 0:
+            recs.append((burn(t), (
+                f"Remove personal skill {name}: never used, ≈{k(t)} per message "
+                f"(≈{fmt(burn(t))}). Reversible: mkdir -p ~/.claude/skills-off && "
+                f"mv {folder} ~/.claude/skills-off/")))
+        elif t >= 150:
+            recs.append((burn(t - 60), (
+                f"Shorten the description of skill {name}: ≈{k(t)} per message. One or two "
+                f"sentences of 'use when …' is enough (edit {folder}/SKILL.md).")))
+    for srv, t in by_server.items():
+        if not srv.startswith(APP_SERVERS) and t >= 300 and not d["mcp_uses"].get(srv):
+            recs.append((burn(t), (
+                f"Turn off MCP server {srv}: never called, ≈{k(t)} of tool definitions per "
+                f"message (≈{fmt(burn(t))}). Use /mcp, or the app's connector settings.")))
+    for name, body in d["skill_bodies"].items():
+        n = uses.get(name, 0)
+        kind, where = skill_source(name)
+        if body >= 3000 and n >= 2:
+            fix = (f"move its reference sections into separate files in {where} that the "
+                   f"skill reads only when needed") if kind == "personal" else \
+                "check that it only triggers when you really need it"
+            recs.append((body * n * p_in * 1.25 / 1e6, (
+                f"Skill {name} loads ≈{k(body)} into the context each time it runs ({n}x). "
+                f"To make it cheaper, {fix}.")))
+    for usd, label, tot in hooks[:3]:
+        if usd >= 0.5:
+            recs.append((usd, (
+                f"Hook '{label}' added ≈{k(tot)} of text in total (≈{fmt(usd)}). If you don't "
+                f"need what it injects, disable its plugin or remove it from ~/.claude/settings.json.")))
+    recs.sort(reverse=True)
+    if not recs:
+        print("  Nothing stands out: everything sent with each message gets used.")
+    for i, (_, text) in enumerate(recs[:10], 1):
+        print(f"  {i}. {text}")
+
+
 # ---------- limits, sync, status line setup ----------
 
 def run_limits(args):
@@ -911,10 +1112,12 @@ def run_install_statusline(force):
 
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "hook"
-    interactive = mode in ("report", "limits", "install-statusline", "context")
+    interactive = mode in ("report", "limits", "install-statusline", "context", "insights")
     try:
         if mode == "statusline":
             run_statusline()
+        elif mode == "insights":
+            run_insights(int(sys.argv[sys.argv.index("--days") + 1]) if "--days" in sys.argv else 14)
         elif mode == "context":
             run_context(sys.argv[sys.argv.index("--session") + 1] if "--session" in sys.argv else None)
         elif mode == "sync":
