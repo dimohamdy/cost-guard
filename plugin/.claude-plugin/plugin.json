@@ -1,8 +1,8 @@
 {
   "name": "cost-guard",
   "displayName": "Cost Guard",
-  "version": "1.0.0",
-  "description": "Alerts and hard stops on Claude Code spend per session and per day, plus a warning before resuming an idle session whose prompt cache expired. No admin rights needed.",
+  "version": "1.1.0",
+  "description": "Alerts and hard stops on Claude Code spend per session and per day, a warning before resuming an idle session whose prompt cache expired, and advice on what in the context to drop. No admin rights needed.",
   "author": { "name": "dimohamdy" },
   "keywords": ["cost", "budget", "spend", "limits"],
   "userConfig": {
@@ -38,6 +38,13 @@
       "title": "Override word",
       "description": "Put this word in a message to continue past a stop.",
       "default": "#override"
+    },
+    "context_warn_k": {
+      "type": "number",
+      "title": "Context advice at (k tokens)",
+      "description": "When the context passes this many thousand tokens, show once what fills it and how to shrink it.",
+      "default": 150,
+      "min": 20
     }
   }
 }

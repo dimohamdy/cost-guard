@@ -9,9 +9,27 @@ so no admin rights are needed.
 | Session passes **$100** | New prompts are **blocked**, and tool calls are **denied mid-turn**, so a long autonomous run also stops |
 | This machine passes **$150 today** (all sessions) | Same block |
 | You come back to an idle session with a big context | Blocked **once** with the cost of re-caching it ("idle 22 h, re-caches 612k tokens ≈ $4.90"). Re-send to continue, or `/clear` |
+| Context passes **150k tokens** | A one-time note on what fills it and what to drop (see below) |
 | Status line (optional) | `Opus 5.5 · session $12.34 · today $40.10 · ctx 612k · cache cold` |
 
 To get past a stop, put `#override` in your message. That adds one more cap-sized allowance.
+The plugin never blocks the app's own bookkeeping tools (task list, wrap-up, plan mode). You can
+change that list with `"never_block": [...]` in `overrides.json`.
+
+## Context advice
+
+Run `/cost-guard:context` at any time. Each alert and stop also includes the top two points.
+The advice comes from the session transcript:
+
+- **Large tool output still in context**, such as a full file read or a long command log.
+  You get a `/compact drop the raw output of …` line that you can paste as is.
+- **The same file read 3 or more times.**
+- **Images** still in context.
+- **MCP servers that load tool definitions into every message but had no calls in
+  14 days.** Turn them off in `/mcp` (in the desktop app, under connector settings).
+- **A large context**, split into fixed overhead, tool output, images and conversation.
+  Use `/clear` for a new task or `/compact` for the same task.
+- **Subagents** that cost more than 30% of the session, and **Opus or Fable** sessions where Sonnet would do.
 
 ## Install
 
@@ -46,6 +64,7 @@ Either way works. The second one wins over the first:
    /cost-guard:limits daily 200       daily cap $200
    /cost-guard:limits alerts 5,20,40  alert amounts
    /cost-guard:limits cold 2          cold-cache warning threshold
+   /cost-guard:limits context 200     context advice at 200k tokens
    /cost-guard:limits reset           back to the plugin options
    ```
 
@@ -77,6 +96,6 @@ $214 (89%) was cache writes.
 .claude-plugin/marketplace.json   marketplace "team-cost-tools"
 plugin/.claude-plugin/plugin.json manifest and the limit options
 plugin/hooks/hooks.json           SessionStart, UserPromptSubmit, PreToolUse
-plugin/commands/                  /cost-guard:limits, :report, :statusline
+plugin/commands/                  /cost-guard:limits, :report, :context, :statusline
 plugin/scripts/cost_guard.py      all logic (Python 3, standard library only)
 ```
