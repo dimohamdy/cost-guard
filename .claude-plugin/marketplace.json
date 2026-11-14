@@ -1,0 +1,12 @@
+{
+  "name": "team-cost-tools",
+  "description": "Spending guardrails for Claude Code",
+  "owner": { "name": "dimohamdy" },
+  "plugins": [
+    {
+      "name": "cost-guard",
+      "description": "Alerts and hard stops on Claude Code spend per session and per day, plus a warning before an expensive cold-cache resume.",
+      "source": "./plugin"
+    }
+  ]
+}

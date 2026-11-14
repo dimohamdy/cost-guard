@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.DS_Store
+state/
+# ~/.gitignore_global ignores "plugin"; keep it here
+!plugin/

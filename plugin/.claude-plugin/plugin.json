@@ -1,0 +1,43 @@
+{
+  "name": "cost-guard",
+  "displayName": "Cost Guard",
+  "version": "1.0.0",
+  "description": "Alerts and hard stops on Claude Code spend per session and per day, plus a warning before resuming an idle session whose prompt cache expired. No admin rights needed.",
+  "author": { "name": "dimohamdy" },
+  "keywords": ["cost", "budget", "spend", "limits"],
+  "userConfig": {
+    "session_cap_usd": {
+      "type": "number",
+      "title": "Session cap (USD)",
+      "description": "Hard stop for one session: new prompts are blocked and tool calls are denied.",
+      "default": 100,
+      "min": 1
+    },
+    "daily_cap_usd": {
+      "type": "number",
+      "title": "Daily cap (USD)",
+      "description": "Hard stop for all sessions on this machine in one calendar day.",
+      "default": 150,
+      "min": 1
+    },
+    "warn_at_usd": {
+      "type": "string",
+      "title": "Alert at (USD)",
+      "description": "Comma-separated session amounts that show a one-time alert without blocking, for example 10,25,50.",
+      "default": "10,25,50"
+    },
+    "cold_cache_warn_usd": {
+      "type": "number",
+      "title": "Cold-cache warning (USD)",
+      "description": "Stop once when resuming an idle session would cost more than this just to re-cache its context.",
+      "default": 1,
+      "min": 0
+    },
+    "override_word": {
+      "type": "string",
+      "title": "Override word",
+      "description": "Put this word in a message to continue past a stop.",
+      "default": "#override"
+    }
+  }
+}
