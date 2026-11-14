@@ -275,9 +275,8 @@ def totals(cfg, transcript_path):
 IMAGE_TOKENS = 1600  # rough cost of one image in context
 APP_SERVERS = ("ccd_",)  # the desktop app's own tools: they can't be turned off
 MCP_USAGE_DAYS = 14
-MCP_NAME = re.compile(rb'"name":\s*"mcp__(.+?)__')
-SKILL_NAME = re.compile(rb'"skill":\s*"([^":]+):')  # plugin prefix of a Skill tool call
-PLUGIN_IN_PATH = re.compile(r"plugins/(?:cache|marketplaces)/[^/]+/([^/\"' ]+)")
+SCAN_DEADLINE_S = 6  # an inline scan gives up after this; hooks time out at 10 s
+INSTALLED_PLUGINS = os.path.expanduser("~/.claude/plugins/installed_plugins.json")
 ATTACHMENT_GROUPS = {  # attachment type -> breakdown row. Types not listed count as "other".
     "skill_listing": "skills_list",
     "invoked_skills": "skills_loaded",
@@ -359,60 +358,118 @@ def describe_use(name, inp):
     return name
 
 
-def tool_usage():
-    """Calls per MCP server and per skill plugin in the last MCP_USAGE_DAYS days.
-    Returns {"mcp": {server: n}, "skills": {plugin: n}}. Cached for a day."""
-    path = os.path.join(STATE_DIR, "tool_usage.json")
+class ScanTimeout(Exception):
+    pass
+
+
+def cached_scan(days=MCP_USAGE_DAYS, deadline=None):
+    """scan_period() result, cached per day. Raises ScanTimeout past `deadline`."""
+    path = os.path.join(STATE_DIR, f"scan_{days}d.json")
     cache = load_json(path, {})
-    if cache.get("day") == today():
-        return cache.get("counts", {"mcp": {}, "skills": {}})
-    counts = {"mcp": {}, "skills": {}}
-    cutoff = time.time() - MCP_USAGE_DAYS * 86400
-
-    def bump(kind, name):
-        counts[kind][name] = counts[kind].get(name, 0) + 1
-
-    for p in glob.glob(os.path.join(PROJECTS, "**", "*.jsonl"), recursive=True):
-        try:
-            if os.path.getmtime(p) < cutoff:
-                continue
-            with open(p, "rb") as f:
-                for raw in f:
-                    if b'"tool_use"' not in raw or b'"type":"assistant"' not in raw:
-                        continue
-                    if b"mcp__" in raw:
-                        for m in MCP_NAME.finditer(raw):
-                            bump("mcp", m.group(1).decode(errors="ignore"))
-                    if b'"Skill"' in raw:
-                        for m in SKILL_NAME.finditer(raw):
-                            bump("skills", m.group(1).decode(errors="ignore"))
-        except OSError:
-            continue
-    save_json(path, {"day": today(), "counts": counts})
-    return counts
+    if cache.get("day") == today() and cache.get("scan"):
+        return cache["scan"]
+    scan = scan_period(days, deadline)
+    save_json(path, {"day": today(), "scan": scan})
+    return scan
 
 
-def skill_listing_by_plugin(text):
-    """{plugin: (tokens, skill count)} from a skill listing ("- plugin:skill: description")."""
+def scan_in_background():
+    """Fill the scan cache in a detached process, so a hook never waits for it."""
+    lock = os.path.join(STATE_DIR, "prescan.lock")
+    try:
+        if time.time() - os.path.getmtime(lock) < 600:
+            return
+    except OSError:
+        pass
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        open(lock, "w").close()
+        import subprocess
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), "prescan"],
+                         env=dict(os.environ, CLAUDE_PLUGIN_DATA=DATA), stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    except Exception:
+        log_error("scan_in_background")
+
+
+def usage_or_none():
+    """Recent tool and skill use, or None when it isn't known yet (never guess "unused")."""
+    try:
+        return cached_scan(deadline=time.time() + SCAN_DEADLINE_S)
+    except ScanTimeout:
+        scan_in_background()
+        return None
+
+
+def uses_by_plugin(skill_uses):
+    out = {}
+    for name, n in skill_uses.items():
+        if ":" in name:
+            plugin = name.split(":", 1)[0]
+            out[plugin] = out.get(plugin, 0) + n
+    return out
+
+
+def parse_listing(text):
+    """{skill name: tokens} from a skill listing ("- plugin:skill: description")."""
     out = {}
     for line in text.splitlines():
-        if not line.startswith("- "):
-            continue
-        name = line[2:].split(": ", 1)[0]
-        plugin = name.split(":", 1)[0] if ":" in name else NO_PLUGIN
-        t, n = out.get(plugin, (0, 0))
-        out[plugin] = (t + toks(line), n + 1)
+        if line.startswith("- "):
+            out[line[2:].split(": ", 1)[0]] = toks(line)
     return out
+
+
+def listing_by_plugin(listing):
+    """{plugin: (tokens, skill count)}; skills without a plugin prefix go under NO_PLUGIN."""
+    out = {}
+    for name, t in listing.items():
+        plugin = name.split(":", 1)[0] if ":" in name else NO_PLUGIN
+        tot, n = out.get(plugin, (0, 0))
+        out[plugin] = (tot + t, n + 1)
+    return out
+
+
+def norm_cmd(cmd):
+    return " ".join(str(cmd).replace('"', "").split())
+
+
+_HOOK_OWNERS = None
+
+
+def hook_owners():
+    """{normalized hook command: plugin name}, from each installed plugin's hooks/hooks.json."""
+    global _HOOK_OWNERS
+    if _HOOK_OWNERS is None:
+        _HOOK_OWNERS = {}
+
+        def commands(obj):
+            if isinstance(obj, dict):
+                for key, val in obj.items():
+                    if key == "command" and isinstance(val, str):
+                        yield val
+                    else:
+                        yield from commands(val)
+            elif isinstance(obj, list):
+                for val in obj:
+                    yield from commands(val)
+
+        plugins = load_json(INSTALLED_PLUGINS, {}).get("plugins") or {}
+        for key, installs in plugins.items():
+            for inst in installs if isinstance(installs, list) else []:
+                hooks = load_json(os.path.join(inst.get("installPath", ""), "hooks", "hooks.json"), {})
+                for cmd in commands(hooks):
+                    _HOOK_OWNERS[norm_cmd(cmd)] = key.split("@")[0]
+    return _HOOK_OWNERS
 
 
 def hook_label(a):
     """Which hook produced this output: its plugin, else a short form of its command."""
-    cmd = a.get("command") or ""
-    m = PLUGIN_IN_PATH.search(cmd)
-    if m:
-        return m.group(1)
-    cmd = " ".join(cmd.replace('"', "").replace("${CLAUDE_PLUGIN_ROOT}/", "").split())
+    cmd = norm_cmd(a.get("command") or "")
     event = (a.get("hookName") or a.get("hookEvent") or "hook").split(":")[0]
+    owner = hook_owners().get(cmd)
+    if owner:
+        return f"plugin {owner} ({event})"
+    cmd = cmd.replace("${CLAUDE_PLUGIN_ROOT}/", "")
     if cmd:
         return f"{event}: {cmd[:40]}"
     text = a.get("content") or ""  # no command recorded: name it by what it says
@@ -445,7 +502,7 @@ def analyze_context(transcript_path, cfg, session_usd=0.0, sub_usd=0.0):
     images, last_ctx, model = 0, 0, None
     groups = {"skills_list": 0, "skills_loaded": 0, "hooks": 0, "tool_lists": 0, "other": 0,
               "conversation": 0}
-    skills_by_plugin, hooks_by_label, loaded_skills = {}, {}, {}
+    listing, hooks_by_label, loaded_skills = {}, {}, {}
     for e in entries[start:]:
         kind = e.get("type")
         msg = e.get("message") or {}
@@ -461,9 +518,7 @@ def analyze_context(transcript_path, cfg, session_usd=0.0, sub_usd=0.0):
                 continue
             groups[group] += n
             if atype == "skill_listing":
-                for plugin, (t, c) in skill_listing_by_plugin(a.get("content") or "").items():
-                    old = skills_by_plugin.get(plugin, (0, 0))
-                    skills_by_plugin[plugin] = (old[0] + t, max(old[1], c))
+                listing.update(parse_listing(a.get("content") or ""))
             elif atype == "invoked_skills":
                 for s in a.get("skills") or []:
                     if isinstance(s, dict):
@@ -510,6 +565,7 @@ def analyze_context(transcript_path, cfg, session_usd=0.0, sub_usd=0.0):
             if srv:
                 by_server[srv] = by_server.get(srv, 0) + n
     overhead = system_tok + tools_tok
+    skills_by_plugin = listing_by_plugin(listing)
     tool_out = sum(t for t, _ in results)
     image_tok = images * IMAGE_TOKENS
 
@@ -547,11 +603,12 @@ def analyze_context(transcript_path, cfg, session_usd=0.0, sub_usd=0.0):
             f"{images} image(s) ≈{k(image_tok)} ride along with every message. "
             f"/compact drops them once you no longer need them.")})
 
-    usage = tool_usage() if (by_server or skills_by_plugin) else {"mcp": {}, "skills": {}}
+    scan = usage_or_none() if (by_server or skills_by_plugin) else None
+    plugin_uses = uses_by_plugin(scan["skill_uses"]) if scan else {}
 
-    if groups["skills_list"] >= 3000:
+    if scan and groups["skills_list"] >= 3000:
         idle = sorted(((t, p, c) for p, (t, c) in skills_by_plugin.items()
-                       if p != NO_PLUGIN and t >= 200 and not usage["skills"].get(p)),
+                       if p != NO_PLUGIN and t >= 200 and not plugin_uses.get(p)),
                       reverse=True)
         if idle:
             save = sum(t for t, _, _ in idle)
@@ -578,9 +635,10 @@ def analyze_context(transcript_path, cfg, session_usd=0.0, sub_usd=0.0):
             f"start-up text isn't useful to you, disable that plugin (/plugin) or remove the hook "
             f"from ~/.claude/settings.json.")})
 
-    counts = usage["mcp"]
+    counts = scan["mcp_uses"] if scan else None
     unused = sorted(((n, s) for s, n in by_server.items()
-                     if not s.startswith(APP_SERVERS) and n >= 300 and not counts.get(s)), reverse=True)
+                     if not s.startswith(APP_SERVERS) and n >= 300 and not counts.get(s)),
+                    reverse=True) if counts is not None else []
     if unused:
         save = sum(n for n, _ in unused)
         listed = ", ".join(f"{s} ≈{k(n)}" for n, s in unused[:5])
@@ -859,24 +917,49 @@ PERSONAL_SKILLS = os.path.expanduser("~/.claude/skills")
 COMMAND_NAME = re.compile(r"<command-name>/?([^<\s]+)</command-name>")
 
 
-def scan_period(days):
-    """One pass over the last `days` of main transcripts. Collects what is sent with
-    every message (skill list, tool definitions), what hooks add, and what gets used."""
+def user_text(content):
+    """What the user typed: plain text blocks only, never tool output."""
+    if isinstance(content, str):
+        return content
+    return " ".join(b.get("text", "") for b in content or []
+                    if isinstance(b, dict) and b.get("type") == "text")
+
+
+def scan_period(days, deadline=None):
+    """One pass over the last `days` of transcripts. Collects what is sent with every
+    message (skill list, tool definitions) and what hooks add, from main transcripts,
+    and what gets used, from main and subagent transcripts. Raises ScanTimeout past
+    `deadline` (a time.time() value)."""
     cutoff = time.time() - days * 86400
     out = {"messages": 0, "sessions": 0, "rewrites": 0, "models": {}, "skill_uses": {},
            "mcp_uses": {}, "skill_bodies": {}, "hook_burn": {}, "listing": {}, "shape": None}
     newest_listing = newest_shape = 0
-    paths = [p for p in glob.glob(os.path.join(PROJECTS, "*", "*.jsonl"))
-             if os.path.getmtime(p) >= cutoff]
+    paths = []
+    for p in glob.glob(os.path.join(PROJECTS, "**", "*.jsonl"), recursive=True):
+        try:
+            if os.path.getmtime(p) >= cutoff:
+                paths.append(p)
+        except OSError:
+            pass
     markers = (b'"usage"', b'"attachment"', b"compact_boundary", b"<command-name>", b'"Skill"',
                b"api-request-shape", b"mcp__")
     for p in paths:
-        mtime = os.path.getmtime(p)
+        if deadline and time.time() > deadline:
+            raise ScanTimeout()
+        sub = f"{os.sep}subagents{os.sep}" in p  # counts for "used", not for what is sent
+        try:
+            mtime = os.path.getmtime(p)
+            f = open(p, "rb")
+        except OSError:
+            continue
         seen, live_hooks, listing = set(), {}, {}
-        out["sessions"] += 1
-        out["rewrites"] += 1
-        with open(p, "rb") as f:
-            for raw in f:
+        if not sub:
+            out["sessions"] += 1
+            out["rewrites"] += 1
+        with f:
+            for i, raw in enumerate(f):
+                if deadline and i % 5000 == 0 and time.time() > deadline:
+                    raise ScanTimeout()
                 if not any(m in raw for m in markers):
                     continue
                 try:
@@ -886,7 +969,9 @@ def scan_period(days):
                 kind = e.get("type")
                 msg = e.get("message") or {}
                 content = msg.get("content")
-                if kind == "assistant" and msg.get("usage") and msg.get("id") not in seen:
+                if sub and kind != "assistant":
+                    continue
+                if not sub and kind == "assistant" and msg.get("usage") and msg.get("id") not in seen:
                     seen.add(msg.get("id"))
                     out["messages"] += 1
                     m = msg.get("model") or "?"
@@ -905,8 +990,7 @@ def scan_period(days):
                         if srv:
                             out["mcp_uses"][srv] = out["mcp_uses"].get(srv, 0) + 1
                 elif kind == "user":
-                    text = content if isinstance(content, str) else json.dumps(content or "")
-                    for name in COMMAND_NAME.findall(text):
+                    for name in COMMAND_NAME.findall(user_text(content)):
                         out["skill_uses"][name] = out["skill_uses"].get(name, 0) + 1
                 elif kind == "system" and e.get("subtype") == "compact_boundary":
                     out["rewrites"] += 1
@@ -917,9 +1001,7 @@ def scan_period(days):
                     a = e.get("attachment") or {}
                     atype = a.get("type")
                     if atype == "skill_listing":
-                        for line in (a.get("content") or "").splitlines():
-                            if line.startswith("- "):
-                                listing[line[2:].split(": ", 1)[0]] = toks(line)
+                        listing.update(parse_listing(a.get("content") or ""))
                     elif atype == "invoked_skills":
                         for s in a.get("skills") or []:
                             if isinstance(s, dict):
@@ -947,10 +1029,10 @@ def skill_source(name):
     return "built-in", None
 
 
-def build_insights(cfg, days):
+def build_insights(cfg, days, scan=None):
     """Returns None when there is no data, else a dict with "header", "table" (lines)
     and "recs": [(usd, key, text)] sorted best first. Items in insights_ignore are left out."""
-    d = scan_period(days)
+    d = scan or cached_scan(days)
     msgs = d["messages"]
     if not msgs:
         return None
@@ -1068,7 +1150,12 @@ def insights_tip(cfg, data):
     last = st.get("shown")
     if last and (time.time() - last) < every * 86400 - 3600:
         return None
-    ins = build_insights(cfg, 14)
+    try:
+        scan = cached_scan(MCP_USAGE_DAYS, deadline=time.time() + SCAN_DEADLINE_S)
+    except ScanTimeout:  # big history: finish in the background, show the tip next start
+        scan_in_background()
+        return None
+    ins = build_insights(cfg, MCP_USAGE_DAYS, scan)
     st["shown"] = time.time()
     save_json(path, st)
     if not ins or not ins["recs"]:
@@ -1088,13 +1175,16 @@ def insights_tip(cfg, data):
 def run_limits(args):
     overrides = load_json(OVERRIDES_PATH, {})
     if args[:1] == ["reset"]:
-        overrides = {}
+        kept = {key: overrides[key] for key in ("insights_ignore",) if overrides.get(key)}
+        overrides = kept
         save_json(OVERRIDES_PATH, overrides)
-        print("Overrides cleared; using the plugin options.")
+        print("Limits are back to the plugin options."
+              + (" Your ignore list is kept (clear it with: limits insights_ignore clear)." if kept else ""))
     elif len(args) >= 2:
         key, val = args[0], ",".join(args[1:]) if args[0] in ("warn_at_usd", "insights_ignore") else args[1]
-        if key == "insights_ignore":  # add to the list instead of replacing it
-            names = [x.strip() for x in f"{overrides.get(key, '')},{val}".split(",") if x.strip()]
+        if key == "insights_ignore":  # add to the list instead of replacing it; "clear" empties it
+            names = [] if val.strip().lower() == "clear" else \
+                [x.strip() for x in f"{overrides.get(key, '')},{val}".split(",") if x.strip()]
             val = ",".join(dict.fromkeys(names))
         if key not in LIMIT_KEYS:
             sys.exit(f"Unknown limit {key!r}. Use one of: {', '.join(LIMIT_KEYS)}")
@@ -1163,6 +1253,15 @@ def run_install_statusline(force):
     print("Status line installed. It shows in new sessions in the terminal.")
 
 
+def arg_after(flag):
+    """Value after `flag`, or None when the flag is missing or has no value."""
+    if flag in sys.argv:
+        i = sys.argv.index(flag) + 1
+        if i < len(sys.argv) and not sys.argv[i].startswith("--"):
+            return sys.argv[i]
+    return None
+
+
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "hook"
     interactive = mode in ("report", "limits", "install-statusline", "context", "insights")
@@ -1170,13 +1269,15 @@ def main():
         if mode == "statusline":
             run_statusline()
         elif mode == "insights":
-            run_insights(int(sys.argv[sys.argv.index("--days") + 1]) if "--days" in sys.argv else 14)
+            run_insights(int(arg_after("--days") or MCP_USAGE_DAYS))
         elif mode == "context":
-            run_context(sys.argv[sys.argv.index("--session") + 1] if "--session" in sys.argv else None)
+            run_context(arg_after("--session"))
+        elif mode == "prescan":
+            cached_scan()
         elif mode == "sync":
             run_sync()
         elif mode == "report":
-            days = int(sys.argv[sys.argv.index("--days") + 1]) if "--days" in sys.argv else 1
+            days = int(arg_after("--days") or 1)
             run_report(days)
         elif mode == "limits":
             run_limits(sys.argv[2:])

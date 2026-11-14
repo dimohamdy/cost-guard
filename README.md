@@ -40,6 +40,8 @@ what goes out with **every** message, with how often it was used and roughly wha
 - **Hooks that inject text** at session start or on tool calls, totaled across sessions.
 
 It is an estimate. It uses the newest session's skill list and tool set as the baseline.
+Use counts include subagents. On a very large history, the first scan finishes in the
+background, and the tips appear at your next session start.
 
 ## Context advice
 
@@ -90,7 +92,8 @@ Either way works. The second one wins over the first:
    /cost-guard:limits alerts 5,20,40  alert amounts
    /cost-guard:limits cold 2          cold-cache warning threshold
    /cost-guard:limits context 200     context advice at 200k tokens
-   /cost-guard:limits reset           back to the plugin options
+   /cost-guard:limits reset           back to the plugin options (keeps your ignore list)
+   /cost-guard:limits ignore clear    show every tip again
    ```
 
 See where the money went: `/cost-guard:report 7` (last 7 days, per session).
