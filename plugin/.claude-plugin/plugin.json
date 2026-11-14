@@ -1,8 +1,8 @@
 {
   "name": "cost-guard",
   "displayName": "Cost Guard",
-  "version": "1.2.0",
-  "description": "Alerts and hard stops on Claude Code spend per session and per day, a warning before resuming an idle session whose prompt cache expired, and advice on what in the context to drop. No admin rights needed.",
+  "version": "2.0.0",
+  "description": "Spending guardrails for Claude Code: session, daily and monthly caps, a runaway-spend breaker, a warning before resuming an idle session, context advice, and tips (with one-step, undoable fixes) for plugins, skills, MCP servers and CLAUDE.md files that burn tokens. No admin rights needed.",
   "author": {
     "name": "dimohamdy"
   },
@@ -26,6 +26,40 @@
       "description": "Hard stop for all sessions on this machine in one calendar day.",
       "default": 150,
       "min": 1
+    },
+    "monthly_cap_usd": {
+      "type": "number",
+      "title": "Monthly budget (USD)",
+      "description": "All sessions on this machine in one calendar month. By default you get a daily warning past it; turn on the hard stop below to block instead.",
+      "default": 300,
+      "min": 1
+    },
+    "monthly_hard_stop": {
+      "type": "boolean",
+      "title": "Stop at the monthly budget",
+      "description": "Block new prompts and tool calls past the monthly budget (otherwise: warn once a day).",
+      "default": false
+    },
+    "warn_at_pct": {
+      "type": "number",
+      "title": "Warn at % of a cap",
+      "description": "One-time warning when the session, day or month reaches this share of its cap, with the pace at which it will be hit.",
+      "default": 80,
+      "min": 0,
+      "max": 100
+    },
+    "burst_usd_per_15min": {
+      "type": "number",
+      "title": "Runaway breaker (USD per 15 min)",
+      "description": "If one session spends more than this within 15 minutes (usually a loop or a huge context), the next tool call is paused once. 0 turns it off.",
+      "default": 15,
+      "min": 0
+    },
+    "desktop_notify": {
+      "type": "boolean",
+      "title": "Desktop notifications",
+      "description": "Show a desktop notification when cost-guard stops a session or a cap warning fires, so you see it while away.",
+      "default": true
     },
     "warn_at_usd": {
       "type": "string",
