@@ -80,18 +80,16 @@ Run `/cost-guard:context` at any time. Each alert and stop also includes the top
 
 ## Install
 
-From a clone of this repository:
-
 ```bash
-claude plugin marketplace add /path/to/claude-cost-guard
+claude plugin marketplace add dimohamdy/cost-guard
 ```
 
 ```bash
 claude plugin install cost-guard@team-cost-tools
 ```
 
-Once the repository is on GitHub, teammates can skip the clone and run
-`/plugin marketplace add <org>/<repo>`, then `/plugin install cost-guard@team-cost-tools`.
+Inside Claude Code, the same is `/plugin marketplace add dimohamdy/cost-guard`, then
+`/plugin install cost-guard@team-cost-tools`. From a local clone, pass its path instead.
 
 Restart open sessions afterwards. Then, optionally, in Claude Code:
 
