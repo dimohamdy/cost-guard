@@ -1,3 +1,5 @@
+![Cost Guard: spending guardrails for AI coding sessions](assets/banner.jpg)
+
 # Cost Guard: a Claude Code plugin
 
 Spending guardrails for Claude Code. Each developer installs it for themselves,
