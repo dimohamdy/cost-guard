@@ -1,12 +1,19 @@
 {
   "name": "team-cost-tools",
   "description": "Spending guardrails for Claude Code",
-  "owner": { "name": "dimohamdy" },
+  "owner": {
+    "name": "dimohamdy"
+  },
   "plugins": [
     {
       "name": "cost-guard",
-      "description": "Alerts and hard stops on Claude Code spend per session and per day, plus a warning before an expensive cold-cache resume.",
+      "description": "Spending guardrails: caps, Pro/Max limit warnings, runaway breaker, cold-cache warning, cost tips with undoable fixes.",
       "source": "./plugin"
+    },
+    {
+      "name": "cost-guard-panel",
+      "description": "A Cost Guard pane in the Claude Code desktop app: 5-hour and weekly limits, spend, pace and the top cost tips.",
+      "source": "./panel"
     }
   ]
 }

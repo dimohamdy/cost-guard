@@ -17,6 +17,44 @@ so no admin rights are needed.
 | A stop or a cap warning, while you're away | A **desktop notification** (macOS, or Linux with `notify-send`) |
 | Status line (optional) | `Opus 5.5 · session $12.34 · today $40.10 · month $210.00 · $18.20/h · ctx 612k · cache cold` |
 
+## Pro, Max and Ultra plans
+
+With a plan there is no per-token bill. What runs out is the **5-hour limit** and the
+**weekly limit**. Claude Code reports both, and Cost Guard detects a plan from them
+(`/cost-guard:limits billing auto`, the default). On a plan:
+
+- **Warnings:** at 80% of either window and again at 95%, once per window. Each warning
+  shows the pace, for example "weekly limit 82% used · at this pace it's full around Wed
+  14:00, before it resets · resets Thu 09:00 (in 1d 19h)". You also get a desktop
+  notification. Cost Guard never blocks a prompt because of a plan limit.
+- **Dollar caps:** they don't apply. Dollar amounts become "API value": what the same
+  usage would cost with an API key.
+- **Still on:** the runaway breaker and the cold-cache stop, because a loop or a large
+  re-cache uses up the 5-hour limit just as quickly.
+- **Status line:** `5h ▓▓▓░░ 62% ↻1h40 · wk ▓▓░░░ 41% ↻Thu · ≈$12.34 API value`.
+
+Behind a company gateway that sets a spend limit, Cost Guard uses that real budget, which
+includes the used and limit amounts in dollars. It warns at 80%, and blocks only with
+`stop-monthly on`.
+
+Claude Code sends these limits only to the status line and to desktop mods, so Cost Guard
+reads them in one of two ways:
+- in the terminal, through `/cost-guard:statusline`;
+- in the desktop app, through the **Cost Guard pane**.
+
+## Desktop pane
+
+The `cost-guard-panel` plugin adds a **Cost Guard** pane next to the chat in the Claude Code
+desktop app. It shows:
+- the 5-hour and weekly limits as bars, each with its reset countdown and pace (or the
+  company spend limit);
+- this session's cost, spend rate and context fill;
+- a 14-day bar chart and the top projects;
+- the top 3 ways to save. Each fixable tip has a **Review and apply…** button that opens
+  `/cost-guard:fix`, which still asks before changing anything.
+
+The pane refreshes after each reply and every minute. `/cost-panel` reopens it.
+
 To get past a stop, put `#override` in your message. That adds one more cap-sized allowance.
 The plugin never blocks the app's own bookkeeping tools (task list, wrap-up, plan mode). You can
 change that list with `"never_block": [...]` in `overrides.json`.
@@ -88,8 +126,16 @@ claude plugin marketplace add dimohamdy/cost-guard
 claude plugin install cost-guard@team-cost-tools
 ```
 
+For the desktop pane, also:
+
+```bash
+claude plugin install cost-guard-panel@team-cost-tools
+```
+
 Inside Claude Code, the same is `/plugin marketplace add dimohamdy/cost-guard`, then
-`/plugin install cost-guard@team-cost-tools`. From a local clone, pass its path instead.
+`/plugin install cost-guard@team-cost-tools`. In the desktop app, click **+** next to the
+prompt box, then **Plugins**, then **Add marketplace** with `dimohamdy/cost-guard`, then add
+both plugins. From a local clone, pass the clone's path instead.
 
 Restart open sessions afterwards. Then, optionally, in Claude Code:
 
@@ -113,6 +159,7 @@ and project limits override both inside their folder:
 /cost-guard:limits burst 15          runaway breaker at $15 per 15 minutes (0 = off)
 /cost-guard:limits notify off        no desktop notifications
 /cost-guard:limits project session 20   a $20 session cap in this folder only
+/cost-guard:limits billing plan      treat this machine as a Pro/Max plan (auto detects it)
 /cost-guard:limits alerts 5,20,40    alert amounts
 /cost-guard:limits cold 2            cold-cache warning threshold
 /cost-guard:limits context 200       context advice at 200k tokens
@@ -155,6 +202,10 @@ python3 -m unittest discover -s tests -v
 claude plugin validate plugin
 ```
 
+```bash
+claude plugin validate panel && claude plugin test panel
+```
+
 The tests use a temporary HOME and synthetic transcripts, so they never touch real data.
 
 ```
@@ -163,6 +214,7 @@ plugin/.claude-plugin/plugin.json manifest and the limit options
 plugin/hooks/hooks.json           SessionStart, UserPromptSubmit, PreToolUse
 plugin/commands/                  /cost-guard:limits, :report, :context, :insights, :fix, :statusline
 plugin/scripts/cost_guard.py      all logic (Python 3, standard library only)
+panel/                            the desktop pane (a Claude Code mod; reads cost_guard.py panel-json)
 tests/test_cost_guard.py          unit tests
 ```
 

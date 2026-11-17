@@ -1,8 +1,8 @@
 {
   "name": "cost-guard",
   "displayName": "Cost Guard",
-  "version": "2.0.0",
-  "description": "Spending guardrails for Claude Code: session, daily and monthly caps, a runaway-spend breaker, a warning before resuming an idle session, context advice, and tips (with one-step, undoable fixes) for plugins, skills, MCP servers and CLAUDE.md files that burn tokens. No admin rights needed.",
+  "version": "2.1.0",
+  "description": "Spending guardrails for Claude Code: session, daily and monthly caps, Pro/Max 5-hour and weekly limit warnings with pace, a runaway-spend breaker, a warning before resuming an idle session, context advice, and tips (with one-step, undoable fixes) for plugins, skills, MCP servers and CLAUDE.md files that burn tokens. No admin rights needed.",
   "author": {
     "name": "dimohamdy"
   },
@@ -93,6 +93,18 @@
       "description": "At session start, show the top 3 ways to cut cost found in your last 14 days (unused plugins, skills, MCP servers, chatty hooks). 0 turns this off.",
       "default": 1,
       "min": 0
+    },
+    "billing": {
+      "type": "string",
+      "title": "Billing",
+      "description": "auto: detect a Pro/Max/Ultra plan (warns on the 5-hour and weekly limits; dollar caps never block), a company gateway (its spend limit), or a pay-per-token API key. Set it to force one.",
+      "default": "auto",
+      "options": [
+        "auto",
+        "subscription",
+        "gateway",
+        "api"
+      ]
     }
   }
 }

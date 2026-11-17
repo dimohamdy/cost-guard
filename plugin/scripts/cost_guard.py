@@ -11,6 +11,8 @@ Modes:
   cost_guard.py limits [KEY VALUE]  Show the limits, or override one (KEY VALUE), or `limits reset`
   cost_guard.py context [--session ID]   What fills the context, and what to do about it
   cost_guard.py install-statusline [--force]   Point ~/.claude/settings.json statusLine at cost-guard
+  cost_guard.py panel-json [--session ID]      Everything the desktop panel draws, as JSON
+  cost_guard.py record-limits                 Save plan/spend limits (JSON on stdin) for the hooks
 
 Limits come from, lowest to highest priority: built-in defaults, the plugin options
 (set when the plugin is enabled, or under /config), then overrides set with `limits`.
@@ -54,6 +56,9 @@ DEFAULT_CONFIG = {
     "context_warn_k": 150,  # one-time advice when the context passes this many thousand tokens
     "insights_every_days": 1,  # cost tips at session start at most this often; 0 turns them off
     "insights_ignore": "",  # comma-separated plugin, skill, server or hook names to never suggest
+    # auto: a Pro/Max/Ultra plan when Claude Code reports 5-hour/weekly limits, a gateway when it
+    # reports a spend limit, else pay-per-token API. On a plan the dollar caps never block.
+    "billing": "auto",
     # Tools a cap never denies: they cost nothing and keep the app's task list and wrap-up working.
     "never_block": ["mcp__ccd_", "TodoWrite", "TaskCreate", "TaskUpdate", "TaskList", "TaskGet",
                     "ExitPlanMode", "AskUserQuestion"],
@@ -101,6 +106,17 @@ def as_bool(val):
     raise ValueError(val)
 
 
+BILLING_MODES = ("auto", "api", "subscription", "gateway")
+
+
+def billing_kind(val):
+    text = str(val).strip().lower()
+    text = {"plan": "subscription", "pro": "subscription", "max": "subscription"}.get(text, text)
+    if text not in BILLING_MODES:
+        raise ValueError(val)
+    return text
+
+
 LIMIT_KEYS = {  # plugin option / override key -> type
     "session_cap_usd": float,
     "daily_cap_usd": float,
@@ -115,6 +131,7 @@ LIMIT_KEYS = {  # plugin option / override key -> type
     "context_warn_k": float,
     "insights_every_days": float,
     "insights_ignore": str,  # comma-separated
+    "billing": billing_kind,
 }
 
 
@@ -353,6 +370,202 @@ def totals(cfg, transcript_path, deadline=None):
         "rate_per_h": recent_spend(mine_entries, 1800) * 2,
         "last_15min": recent_spend(mine_entries, 900),
     }
+
+
+# ---------- plan limits (Pro / Max / Ultra) and gateway spend limits ----------
+# Claude Code reports these only to the status line (stdin `rate_limits`) and to desktop
+# mods ($.session.usage). Both record the latest reading here; hooks read it back.
+
+LIMITS_PATH = os.path.join(STATE_DIR, "rate_limits.json")
+LIMIT_WARNED_PATH = os.path.join(STATE_DIR, "limit_warned.json")
+LIMIT_SAMPLES = 48  # readings kept per window, for the pace
+LIMIT_FRESH_S = 7 * 86400  # a reading older than this no longer decides the billing mode
+WINDOW_LABELS = {"five_hour": "5-hour limit", "seven_day": "weekly limit", "spend_limit": "spend limit"}
+
+
+def _num(val):
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _epoch(val):
+    """A reset time as epoch seconds, from epoch seconds, epoch ms or an ISO 8601 string."""
+    if val in (None, ""):
+        return None
+    n = _num(val)
+    if n is not None:
+        return n / 1000 if n > 1e12 else n
+    try:
+        return datetime.fromisoformat(str(val).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def normalize_limits(raw):
+    """{kind: {pct, resets_at, [used_usd, limit_usd, period]}} from the status line's
+    `rate_limits` object or the mod API's list of {kind, percentUsed, resetsAt}."""
+    if isinstance(raw, list):
+        items = [(w.get("kind"), w) for w in raw if isinstance(w, dict)]
+    elif isinstance(raw, dict):
+        items = list(raw.items())
+    else:
+        return {}
+    out = {}
+    for kind, w in items:
+        if not kind or not isinstance(w, dict):
+            continue
+        pct = _num(w.get("used_percentage", w.get("percentUsed")))
+        if pct is None:
+            continue
+        entry = {"pct": pct, "resets_at": _epoch(w.get("resets_at", w.get("resetsAt")))}
+        for key, alt in (("used_usd", "usedUsd"), ("limit_usd", "limitUsd")):
+            val = _num(w.get(key, w.get(alt)))
+            if val is not None:
+                entry[key] = val
+        if w.get("period"):
+            entry["period"] = str(w["period"])
+        out[str(kind)] = entry
+    return out
+
+
+def record_limits(raw, source="statusline", now=None):
+    """Save the latest reading and append it to each window's samples. Returns the windows."""
+    windows = normalize_limits(raw)
+    if not windows:
+        return None
+    now = now or time.time()
+    data = load_json(LIMITS_PATH, {})
+    samples = data.get("samples") or {}
+    for kind, w in windows.items():
+        keep = [s for s in samples.get(kind, []) if s[2] == w["resets_at"]]  # this window instance only
+        if not keep or keep[-1][1] != w["pct"] or now - keep[-1][0] >= 300:
+            keep.append([now, w["pct"], w["resets_at"]])
+        samples[kind] = keep[-LIMIT_SAMPLES:]
+    data.update(ts=now, source=source, windows=windows, samples=samples)
+    save_json(LIMITS_PATH, data)
+    return windows
+
+
+def load_limits(now=None):
+    """{"ts", "kinds" (seen in the last reading), "windows" (still running), "samples"}, or {}."""
+    now = now or time.time()
+    data = load_json(LIMITS_PATH, {})
+    if not data.get("ts") or now - data["ts"] > LIMIT_FRESH_S:
+        return {}
+    raw = data.get("windows") or {}
+    live = {kind: w for kind, w in raw.items() if not w.get("resets_at") or w["resets_at"] > now}
+    return {"ts": data["ts"], "kinds": sorted(raw), "windows": live, "samples": data.get("samples") or {}}
+
+
+def billing_mode(cfg, lim):
+    mode = cfg.get("billing", "auto")
+    if mode != "auto":
+        return mode
+    kinds = set(lim.get("kinds") or [])
+    if "spend_limit" in kinds:
+        return "gateway"
+    if kinds & {"five_hour", "seven_day"}:
+        return "subscription"
+    return "api"
+
+
+def limit_pace(samples, window, now=None):
+    """{"per_h", "full_at", "before_reset"} from this window's samples, or None when the
+    readings are too few, too close together, or not rising."""
+    now = now or time.time()
+    span = 3600 if window.get("resets_at") and window["resets_at"] - now < 6 * 3600 else 12 * 3600
+    pts = [s for s in samples if s[0] >= now - span] or samples[-2:]
+    if len(pts) < 2 or pts[-1][0] - pts[0][0] < 600:
+        return None
+    per_h = (pts[-1][1] - pts[0][1]) / ((pts[-1][0] - pts[0][0]) / 3600)
+    if per_h <= 0.05:
+        return None
+    full_at = now + max(100 - window["pct"], 0) / per_h * 3600
+    reset = window.get("resets_at")
+    return {"per_h": round(per_h, 2), "full_at": full_at, "before_reset": bool(reset and full_at < reset)}
+
+
+def fmt_when(ts, now=None):
+    """'14:05', 'tomorrow 09:00' or 'Thu 09:00'."""
+    now = now or time.time()
+    when, today_d = datetime.fromtimestamp(ts), datetime.fromtimestamp(now).date()
+    days = (when.date() - today_d).days
+    if days == 0:
+        return when.strftime("%H:%M")
+    if days == 1:
+        return when.strftime("tomorrow %H:%M")
+    return when.strftime("%a %H:%M")
+
+
+def fmt_in(seconds):
+    """'25 min', '1h40', '2d 3h'."""
+    minutes = max(int(seconds // 60), 0)
+    if minutes < 60:
+        return f"{minutes} min"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 48:
+        return f"{hours}h{minutes:02d}"
+    return f"{hours // 24}d {hours % 24}h"
+
+
+def describe_limit(kind, w, samples, now=None):
+    """One line: 'weekly limit 82% used · full around Wed 14:00 at this pace · resets Thu 09:00'."""
+    now = now or time.time()
+    if kind == "spend_limit" and w.get("limit_usd"):
+        text = (f"company spend limit {fmt(w.get('used_usd', 0))} of {fmt(w['limit_usd'])}"
+                f"{' ' + w['period'] if w.get('period') else ''} ({w['pct']:.0f}%)")
+    else:
+        text = f"{WINDOW_LABELS.get(kind, kind)} {w['pct']:.0f}% used"
+    p = limit_pace(samples.get(kind, []), w, now)
+    if p and w["pct"] < 100:
+        text += (f" · at this pace it's full around {fmt_when(p['full_at'], now)}"
+                 + (", before it resets" if p["before_reset"] else ""))
+    if w.get("resets_at"):
+        text += f" · resets {fmt_when(w['resets_at'], now)} (in {fmt_in(w['resets_at'] - now)})"
+    return text
+
+
+def limit_warning(cfg, lim, now=None):
+    """(text, title) the first time a window passes warn_at_pct, and again at 95%, once per
+    window instance (a window that resets warns again). None otherwise."""
+    now = now or time.time()
+    warned = {key: ts for key, ts in load_json(LIMIT_WARNED_PATH, {}).items() if now - ts < 8 * 86400}
+    levels = sorted({lvl for lvl in (cfg["warn_at_pct"], 95) if 0 < lvl <= 100}, reverse=True)
+    found = None
+    for kind in ("five_hour", "seven_day", "spend_limit"):
+        w = (lim.get("windows") or {}).get(kind)
+        if not w:
+            continue
+        reached = next((lvl for lvl in levels if w["pct"] >= lvl), None)
+        if reached is None:
+            continue
+        key = f"{kind}:{int(w.get('resets_at') or 0)}:{reached:g}"
+        if key in warned:
+            continue
+        for lvl in levels:  # a jump straight to 95% also covers the lower level
+            if lvl <= reached:
+                warned[f"{kind}:{int(w.get('resets_at') or 0)}:{lvl:g}"] = now
+        line = describe_limit(kind, w, lim.get("samples") or {}, now)
+        found = (f"cost-guard: {line}.", f"Claude {WINDOW_LABELS.get(kind, kind)} at {w['pct']:.0f}%")
+        break
+    save_json(LIMIT_WARNED_PATH, warned)
+    return found
+
+
+def plan_note(lim, now=None):
+    """' Your 5-hour limit is at 62% (resets in 1h40).' or ''."""
+    w = (lim.get("windows") or {}).get("five_hour")
+    if not w:
+        return ""
+    reset = f" (resets in {fmt_in(w['resets_at'] - (now or time.time()))})" if w.get("resets_at") else ""
+    return f" Your 5-hour limit is at {w['pct']:.0f}%{reset}."
+
+
+def bar(pct, width=5):
+    filled = min(max(round(pct / 100 * width), 0), width)
+    return "▓" * filled + "░" * (width - filled)
 
 
 # ---------- context analysis ----------
@@ -1012,9 +1225,26 @@ def check(data, cfg):
     override = event == "UserPromptSubmit" and cfg["override_word"] in prompt
     block = warn = None
     where = f" (project limits for {cfg['project']})" if cfg.get("project") else ""
+    lim = load_limits(now)
+    billing = billing_mode(cfg, lim)
+    plan = billing == "subscription"  # no per-token bill: dollar caps inform, never stop
+    if plan:
+        caps = []
 
     over = [(name, spent, cap, what) for name, spent, cap, what in caps if spent >= cap
             and (name != "monthly" or cfg["monthly_hard_stop"])]
+    # Behind a gateway the spend limit is the real budget; stop at it only with monthly_hard_stop.
+    spend = (lim.get("windows") or {}).get("spend_limit")
+    spend_key = f"extra:spend:{int((spend or {}).get('resets_at') or 0)}:{this_month()}"
+    if (billing == "gateway" and spend and spend["pct"] >= 100 and cfg["monthly_hard_stop"]
+            and not shared.get(spend_key) and not over):
+        if override:
+            shared[spend_key] = True
+            warn = "cost-guard: override accepted for the company spend limit."
+        else:
+            block = (f"cost-guard stopped this: the {describe_limit('spend_limit', spend, {}, now)}. "
+                     f"Re-send your message with {cfg['override_word']} in it to continue.") + tips()
+            notify(cfg, "Claude Code stopped by cost-guard", "Company spend limit reached")
     if over:
         if override:
             # New cap = current spend + one more cap-sized allowance.
@@ -1040,7 +1270,7 @@ def check(data, cfg):
         st["burst_ack"] = now
         block = (f"cost-guard paused this: the session spent {fmt(t['last_15min'])} in the last 15 "
                  f"minutes (limit {fmt(burst)}), which usually means a loop or a very large context."
-                 + pace(rate, session, s_cap, "session") + tips())
+                 + (plan_note(lim, now) if plan else pace(rate, session, s_cap, "session")) + tips())
         notify(cfg, "Claude Code: runaway spend paused",
                f"{fmt(t['last_15min'])} in 15 min. Check the session.")
     if event == "UserPromptSubmit" and override:
@@ -1065,7 +1295,7 @@ def check(data, cfg):
                          f"message (this warning shows once).") + tips()
 
     # Monthly budget in warn-only mode: once a day, not a stop.
-    if not block and not warn and monthly is not None and not cfg["monthly_hard_stop"]:
+    if not block and not warn and monthly is not None and not cfg["monthly_hard_stop"] and not plan:
         m_cap = cfg["monthly_cap_usd"]
         if monthly >= m_cap and not shared.get(f"over:{day_key}"):
             shared[f"over:{day_key}"] = True
@@ -1073,6 +1303,14 @@ def check(data, cfg):
                     f"{fmt(m_cap)} monthly budget. Every session counts toward it."
                     + (tips() or " /clear between tasks keeps each message cheap."))
             notify(cfg, "Claude Code is over the monthly budget", f"{fmt(monthly)} of {fmt(m_cap)}")
+
+    # Plan limits (5-hour, weekly) and a gateway's spend limit: warn, never stop.
+    if not block and not warn and lim.get("windows"):
+        found = limit_warning(cfg, lim, now)
+        if found:
+            warn = found[0] + (tips() or " To stretch it: /clear between tasks, and Sonnet for "
+                                         "routine work.")
+            notify(cfg, found[1], found[0].replace("cost-guard: ", ""))
 
     # Percent-of-cap warnings, once per session / day / month.
     if not block and not warn:
@@ -1093,7 +1331,13 @@ def check(data, cfg):
 
     if not block and not warn:
         crossed = [x for x in cfg["session_warn_usd"] if session >= x and x not in st["warned"]]
-        if crossed:
+        if crossed and plan:
+            st["warned"] += crossed
+            five = (lim.get("windows") or {}).get("five_hour")
+            warn = (f"cost-guard: this session has used about {fmt(session)} of API-equivalent usage"
+                    + (f"; your 5-hour limit is at {five['pct']:.0f}%" if five else "") + "."
+                    + (tips() or " Tip: /clear between tasks makes your plan limits last longer."))
+        elif crossed:
             st["warned"] += crossed
             warn = (f"cost-guard: this session has now cost about {fmt(session)} "
                     f"(today: {fmt(daily)}). Hard stop at {fmt(s_cap)}."
@@ -1153,14 +1397,38 @@ def run_statusline():
     def color(v, cap):
         return red if v >= cap * 0.8 else yellow if v >= cap * 0.4 else green
 
+    try:
+        record_limits(data.get("rate_limits"), "statusline")
+    except Exception:
+        log_error("record_limits")
+    lim = load_limits()
+    billing = billing_mode(cfg, lim)
+    now = time.time()
+
+    def pct_color(p):
+        return red if p >= 80 else yellow if p >= 50 else green
+
     parts = []
     model = (data.get("model") or {}).get("display_name")
     if model:
         parts.append(f"{dim}{model}{reset}")
-    parts.append(f"{color(session, cfg['session_cap_usd'])}session {fmt(session)}{reset}")
-    parts.append(f"{color(daily, cfg['daily_cap_usd'])}today {fmt(daily)}{reset}")
-    if monthly is not None:
-        parts.append(f"{color(monthly, cfg['monthly_cap_usd'])}month {fmt(monthly)}{reset}")
+    for kind, short in (("five_hour", "5h"), ("seven_day", "wk"), ("spend_limit", "spend")):
+        w = (lim.get("windows") or {}).get(kind)
+        if not w:
+            continue
+        when = ""
+        if w.get("resets_at"):
+            left = w["resets_at"] - now
+            when = f" ↻{fmt_in(left) if left < 86400 else datetime.fromtimestamp(w['resets_at']).strftime('%a')}"
+        money = f" {fmt(w['used_usd'])}/{fmt(w['limit_usd'])}" if w.get("limit_usd") else ""
+        parts.append(f"{pct_color(w['pct'])}{short} {bar(w['pct'])} {w['pct']:.0f}%{money}{reset}{dim}{when}{reset}")
+    if billing == "subscription":
+        parts.append(f"{dim}≈{fmt(session)} API value{reset}")
+    else:
+        parts.append(f"{color(session, cfg['session_cap_usd'])}session {fmt(session)}{reset}")
+        parts.append(f"{color(daily, cfg['daily_cap_usd'])}today {fmt(daily)}{reset}")
+        if monthly is not None:
+            parts.append(f"{color(monthly, cfg['monthly_cap_usd'])}month {fmt(monthly)}{reset}")
     if t["rate_per_h"] >= 1:
         hot = t["last_15min"] >= cfg["burst_usd_per_15min"] * 0.5
         parts.append(f"{red if hot else dim}{fmt(t['rate_per_h'])}/h{reset}")
@@ -1181,6 +1449,22 @@ def load_json_stdin():
 
 # ---------- report ----------
 
+def group_spend(files, first_day, by):
+    """[(usd, key)] from ledger entries, from first_day on. Days sort by date, the rest by spend."""
+    groups = {}
+    for p, e in files.items():
+        for day, models in e.get("by_day_model", {}).items():
+            if day < first_day:
+                continue
+            for model, usd in models.items():
+                key = {"session": os.path.relpath(p, PROJECTS),
+                       "project": e.get("cwd") or os.path.basename(os.path.dirname(p)),
+                       "model": model, "day": day}[by]
+                groups[key] = groups.get(key, 0.0) + usd
+    return sorted(((usd, key) for key, usd in groups.items() if usd >= 0.01),
+                  key=lambda r: r[1] if by == "day" else -r[0])
+
+
 def run_report(args):
     """report [--days N | --week | --month] [--by session|project|model|day] [--json]"""
     cfg = load_config()
@@ -1194,18 +1478,7 @@ def run_report(args):
         sys.exit("--by takes one of: session, project, model, day")
     files, _, _ = refresh(cfg, None, window_s=time.time() - since)
     first_day = datetime.fromtimestamp(since).strftime("%Y-%m-%d")
-    groups = {}
-    for p, e in files.items():
-        for day, models in e.get("by_day_model", {}).items():
-            if day < first_day:
-                continue
-            for model, usd in models.items():
-                key = {"session": os.path.relpath(p, PROJECTS),
-                       "project": e.get("cwd") or os.path.basename(os.path.dirname(p)),
-                       "model": model, "day": day}[by]
-                groups[key] = groups.get(key, 0.0) + usd
-    rows = sorted(((usd, key) for key, usd in groups.items() if usd >= 0.01),
-                  key=lambda r: r[1] if by == "day" else -r[0])
+    rows = group_spend(files, first_day, by)
     total = sum(usd for usd, _ in rows)
     if "--json" in args:
         print(json.dumps({"period": {"from": first_day, "to": today()}, "by": by, "total_usd": round(total, 4),
@@ -1537,6 +1810,90 @@ def insights_tip(cfg, data):
     return "\n".join(lines)
 
 
+# ---------- data for the desktop panel ----------
+
+PANEL_VERSION = 1
+
+
+def fresh_scan_or_none(days=MCP_USAGE_DAYS):
+    """Today's cached scan, or None (and a background scan) when there is none yet."""
+    cache = load_json(os.path.join(STATE_DIR, f"scan_v{SCAN_VERSION}_{days}d.json"), {})
+    if cache.get("day") == today() and cache.get("scan"):
+        return cache["scan"]
+    scan_in_background()
+    return None
+
+
+def panel_data(session_id=None, now=None):
+    """Everything the Cost Guard pane draws, as one JSON-ready dict. Never scans for long:
+    the month and the tips come from what is already known, the rest fills in later."""
+    now = now or time.time()
+    path = find_transcript(session_id)
+    cwd = None
+    for entry in iter_jsonl(path) if path else []:
+        if entry.get("cwd"):
+            cwd = entry["cwd"]
+            break
+    cfg = load_config(cwd)
+    t = totals(cfg, path, deadline=now + 3)
+    lim = load_limits(now)
+    billing = billing_mode(cfg, lim)
+    samples = lim.get("samples") or {}
+    limits = []
+    for kind in ("five_hour", "seven_day", "spend_limit"):
+        w = (lim.get("windows") or {}).get(kind)
+        if not w:
+            continue
+        p = limit_pace(samples.get(kind, []), w, now)
+        limits.append(dict(w, kind=kind, label=WINDOW_LABELS[kind], text=describe_limit(kind, w, samples, now),
+                           resets_in=fmt_in(w["resets_at"] - now) if w.get("resets_at") else None,
+                           resets_when=fmt_when(w["resets_at"], now) if w.get("resets_at") else None,
+                           pace=dict(p, full_when=fmt_when(p["full_at"], now)) if p else None))
+    files = load_json(LEDGER_PATH, {}).get("files") or {}
+    first_day = datetime.fromtimestamp(now - 13 * 86400).strftime("%Y-%m-%d")
+    by_day = {key: usd for usd, key in group_spend(files, first_day, "day")}
+    days = [datetime.fromtimestamp(now - i * 86400).strftime("%Y-%m-%d") for i in range(13, -1, -1)]
+    month_first = datetime.fromtimestamp(now).strftime("%Y-%m-01")
+    scan = fresh_scan_or_none()
+    tips = None
+    if scan:
+        ins = build_insights(cfg, MCP_USAGE_DAYS, scan) or {"recs": []}
+        tips = [{"key": r["key"], "usd": round(r["score"], 2), "text": r["text"],
+                 "fixable": bool(r.get("action") and resolve_action(r["action"]))} for r in ins["recs"][:3]]
+    main = t["main"]
+    try:
+        found = analyze_context(path, cfg, t["session"], max(t["session"] - main.get("total", 0.0), 0.0)) \
+            if path and os.path.exists(path) else {"findings": []}
+        tips_now = [f["text"] for f in found["findings"][:3]]
+    except Exception:
+        log_error("panel advice")
+        tips_now = []
+    return {
+        "v": PANEL_VERSION, "generated_at": now, "billing": billing, "limits": limits,
+        "session": {"usd": round(t["session"], 4), "rate_per_h": round(t["rate_per_h"], 2),
+                    "last_15min": round(t["last_15min"], 2), "ctx": main.get("last_ctx", 0),
+                    "model": main.get("model"),
+                    "cache_cold": bool(main.get("ttl") and main.get("last_ts")
+                                       and (now - main["last_ts"]) / 60 > main["ttl"])},
+        "today": round(t["daily"], 4), "month": None if t["monthly"] is None else round(t["monthly"], 4),
+        "caps": {"session": cfg["session_cap_usd"], "daily": cfg["daily_cap_usd"],
+                 "monthly": cfg["monthly_cap_usd"], "warn_at_pct": cfg["warn_at_pct"],
+                 "monthly_hard_stop": cfg["monthly_hard_stop"]},
+        "by_day": [{"day": d, "usd": round(by_day.get(d, 0.0), 2)} for d in days],
+        "by_project": [{"key": key, "name": os.path.basename(key.rstrip(os.sep)) or key, "usd": round(usd, 2)}
+                       for usd, key in group_spend(files, month_first, "project")[:5]],
+        "by_model": [{"key": key, "usd": round(usd, 2)} for usd, key in group_spend(files, month_first, "model")[:5]],
+        "tips": tips, "advice": tips_now,
+    }
+
+
+def run_record_limits():
+    raw = load_json_stdin()
+    if isinstance(raw, dict) and "rate_limits" in raw:
+        raw = raw["rate_limits"]
+    record_limits(raw, "desktop")
+
+
 # ---------- reversible fixes ----------
 
 CLAUDE_JSON = os.path.expanduser("~/.claude.json")
@@ -1745,6 +2102,8 @@ def run_limits(args):
         ("insights_every_days", f"{cfg['insights_every_days']:g} day(s)" if cfg["insights_every_days"] > 0
          else "off", "cost tips at session start"),
         ("insights_ignore", cfg["insights_ignore"] or "none", "never suggest these"),
+        ("billing", cfg["billing"] if cfg["billing"] != "auto" else
+         f"auto ({billing_mode(cfg, load_limits())})", "plan: dollar caps never block"),
     ]
     for key, val, what in rows:
         src = "override" if key in overrides else "plugin option" if key in session else "default"
@@ -1804,12 +2163,16 @@ def arg_after(flag, args=None):
 
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "hook"
-    interactive = mode in ("report", "limits", "install-statusline", "context", "insights", "fix")
+    interactive = mode in ("report", "limits", "install-statusline", "context", "insights", "fix", "panel-json")
     try:
         if mode == "statusline":
             run_statusline()
         elif mode == "fix":
             run_fix(sys.argv[2:])
+        elif mode == "panel-json":
+            print(json.dumps(panel_data(arg_after("--session"))))
+        elif mode == "record-limits":
+            run_record_limits()
         elif mode == "insights":
             run_insights(int(arg_after("--days") or MCP_USAGE_DAYS))
         elif mode == "context":

@@ -1,0 +1,15 @@
+{
+  "name": "cost-guard-panel",
+  "version": "0.1.0",
+  "description": "A Cost Guard pane in Claude Code: 5-hour and weekly plan limits, spend, pace and the top cost tips.",
+  "author": { "name": "dimohamdy" },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "script_path": {
+      "type": "string",
+      "title": "cost_guard.py path",
+      "description": "Leave empty to use the copy Cost Guard keeps in its data folder.",
+      "default": ""
+    }
+  }
+}

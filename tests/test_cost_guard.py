@@ -296,6 +296,113 @@ class Reports(Base):
         self.assertEqual(data["rows"][0]["key"], OPUS)
 
 
+def plan_reading(five=None, week=None, spend=None, resets_in=3 * 3600, ts=None):
+    """Record a status-line style rate_limits reading."""
+    raw, reset = {}, time.time() + resets_in
+    if five is not None:
+        raw["five_hour"] = {"used_percentage": five, "resets_at": reset}
+    if week is not None:
+        raw["seven_day"] = {"used_percentage": week, "resets_at": reset + 3 * 86400}
+    if spend is not None:
+        raw["spend_limit"] = dict({"resets_at": reset + 10 * 86400}, **spend)
+    return cg.record_limits(raw, "test", now=ts)
+
+
+class PlanLimits(Base):
+    def test_plan_is_detected_and_dollar_caps_never_block(self):
+        set_overrides(session_cap_usd=1, daily_cap_usd=1, monthly_cap_usd=1, monthly_hard_stop="true",
+                      warn_at_usd="100", context_warn_k=100000, burst_usd_per_15min=0)
+        plan_reading(five=10, week=20)
+        self.assertEqual(cg.billing_mode(cg.load_config(), cg.load_limits()), "subscription")
+        path = write_transcript("s1", [assistant("m1", usd_input_tokens=50_000_000)])  # $200
+        block, warn = hook(path)
+        self.assertIsNone(block)
+        self.assertIn("$200.00 of API-equivalent usage; your 5-hour limit is at 10%", warn)
+        set_overrides(session_cap_usd=1, billing="api", warn_at_usd="100")
+        self.assertIn("cost-guard stopped this", hook(path, sid="s2")[0])
+
+    def test_weekly_warning_once_per_window_then_at_95_and_again_after_reset(self):
+        set_overrides(context_warn_k=100000, warn_at_usd="100")
+        path = write_transcript("s1", [assistant("m1", usd_input_tokens=1000)])
+        plan_reading(five=10, week=82)
+        block, warn = hook(path)
+        self.assertIsNone(block)
+        self.assertIn("weekly limit 82% used", warn)
+        self.assertIsNone(hook(path)[1])
+        plan_reading(five=10, week=96)
+        self.assertIn("weekly limit 96% used", hook(path)[1])
+        self.assertIsNone(hook(path)[1])
+        plan_reading(five=10, week=85, resets_in=4 * 3600)  # a new window instance
+        self.assertIn("weekly limit 85% used", hook(path)[1])
+
+    def test_pace_predicts_when_the_window_fills(self):
+        now = time.time()
+        reset = now + 4 * 3600
+        samples = [[now - 3600, 40, reset], [now - 1800, 50, reset], [now, 60, reset]]
+        p = cg.limit_pace(samples, {"pct": 60, "resets_at": reset}, now)
+        self.assertAlmostEqual(p["per_h"], 20)
+        self.assertAlmostEqual(p["full_at"], now + 2 * 3600, delta=1)
+        self.assertTrue(p["before_reset"])
+        self.assertIsNone(cg.limit_pace(samples[-1:], {"pct": 60, "resets_at": reset}, now))
+
+    def test_gateway_spend_limit_warns_and_stops_only_with_hard_stop(self):
+        set_overrides(context_warn_k=100000, warn_at_usd="100")
+        path = write_transcript("s1", [assistant("m1", usd_input_tokens=1000)])
+        plan_reading(spend={"used_percentage": 84, "used_usd": 252, "limit_usd": 300, "period": "monthly"})
+        self.assertEqual(cg.billing_mode(cg.load_config(), cg.load_limits()), "gateway")
+        block, warn = hook(path)
+        self.assertIsNone(block)
+        self.assertIn("company spend limit $252.00 of $300.00 monthly", warn)
+        plan_reading(spend={"used_percentage": 101, "used_usd": 303, "limit_usd": 300})
+        self.assertIsNone(hook(path, sid="s2")[0])
+        set_overrides(context_warn_k=100000, warn_at_usd="100", monthly_hard_stop="true")
+        self.assertIn("spend limit", hook(path, sid="s3")[0])
+        self.assertIn("override accepted", hook(path, sid="s3", event="UserPromptSubmit",
+                                                prompt="#override")[1])
+        self.assertIsNone(hook(path, sid="s3")[0])
+
+    def test_record_limits_accepts_the_desktop_list_and_drops_reset_windows(self):
+        reset_iso = datetime.fromtimestamp(time.time() + 3600, timezone.utc).isoformat()
+        done = subprocess.run([sys.executable, SCRIPT, "record-limits"], capture_output=True, text=True,
+                              env=dict(os.environ), input=json.dumps(
+                                  [{"kind": "five_hour", "percentUsed": 23.5, "resetsAt": reset_iso},
+                                   {"kind": "seven_day", "percentUsed": 41, "resetsAt": "2000-01-01T00:00:00Z"}]))
+        self.assertEqual(done.returncode, 0, done.stderr)
+        lim = cg.load_limits()
+        self.assertEqual(lim["kinds"], ["five_hour", "seven_day"])
+        self.assertEqual(list(lim["windows"]), ["five_hour"])  # the weekly one already reset
+        self.assertAlmostEqual(lim["windows"]["five_hour"]["resets_at"], time.time() + 3600, delta=5)
+
+    def test_panel_json_shape(self):
+        write_transcript("s1", [assistant("m1", usd_input_tokens=1_000_000)])
+        plan_reading(five=62, week=41)
+        start = time.time()
+        done = subprocess.run([sys.executable, SCRIPT, "panel-json", "--session", "s1"],
+                              capture_output=True, text=True, env=dict(os.environ))
+        self.assertLess(time.time() - start, 5)
+        d = json.loads(done.stdout)
+        self.assertEqual(d["billing"], "subscription")
+        self.assertEqual([w["kind"] for w in d["limits"]], ["five_hour", "seven_day"])
+        self.assertAlmostEqual(d["session"]["usd"], 4.0)
+        self.assertEqual(len(d["by_day"]), 14)
+        self.assertAlmostEqual(d["by_day"][-1]["usd"], 4.0)
+        self.assertEqual(d["by_project"][0]["name"], "app")
+
+    def test_status_line_shows_plan_bars_and_records_the_reading(self):
+        path = write_transcript("s1", [assistant("m1", usd_input_tokens=1_000_000)])
+        stdin = {"transcript_path": path, "model": {"display_name": "Opus 5.5"},
+                 "rate_limits": {"five_hour": {"used_percentage": 62, "resets_at": time.time() + 6000},
+                                 "seven_day": {"used_percentage": 41, "resets_at": time.time() + 4 * 86400}}}
+        done = subprocess.run([sys.executable, SCRIPT, "statusline"], capture_output=True, text=True,
+                              env=dict(os.environ), input=json.dumps(stdin))
+        out = done.stdout
+        self.assertIn("5h ▓▓▓░░ 62%", out)
+        self.assertIn("wk ▓▓░░░ 41%", out)
+        self.assertIn("API value", out)
+        self.assertNotIn("session $", out)
+        self.assertEqual(cg.load_limits()["windows"]["five_hour"]["pct"], 62)
+
+
 class FailOpen(Base):
     def test_garbage_input_exits_zero_with_no_output(self):
         done = subprocess.run([sys.executable, SCRIPT, "hook"], input="not json", capture_output=True,
