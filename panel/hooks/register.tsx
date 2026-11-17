@@ -78,33 +78,108 @@ export function mergeLimits(d: PanelData | null, l: Live, now: number): (LimitWi
   return out
 }
 
-/** A 14-day bar chart as one SVG document, today in the accent colour. */
-export function dayChart(days: { day: string; usd: number }[]): string {
+// ---------- drawings ----------
+// An Svg is drawn as an image, so it can't read the app's colour tokens: each one carries
+// both themes and picks one with prefers-color-scheme. Status steps are fixed in both.
+const GOOD = '#0ca30c'
+const WARN = '#fab219'
+const CRIT = '#d03b3b'
+const STYLE =
+  '<style>' +
+  'text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif}' +
+  '.ink{fill:#0b0b0b}.sub{fill:#52514e}.track{stroke:#e8e7e3}.grid{stroke:#e2e1dc}' +
+  '.bar{fill:#2a78d6}.bar:hover,.hit:hover+.bar{opacity:.8}.today{fill:#eb6834}.avg{stroke:#52514e}' +
+  '@media (prefers-color-scheme:dark){.ink{fill:#f0efec}.sub{fill:#c3c2b7}.track{stroke:#383835}' +
+  '.grid{stroke:#383835}.bar{fill:#3987e5}.today{fill:#d95926}.avg{stroke:#c3c2b7}}' +
+  '</style>'
+
+export function statusHex(pct: number): string {
+  return pct >= 80 ? CRIT : pct >= 50 ? WARN : GOOD
+}
+
+function esc(text: string): string {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
+export type Ring = { label: string; pct: number; sub: string }
+
+/** One to three ring gauges side by side: the % in the middle, the label and a note below. */
+export function ringsSvg(rings: Ring[]): string {
   const w = 300
-  const h = 96
-  const top = 14
-  const base = h - 16
-  const max = Math.max(...days.map(d => d.usd), 0.01)
-  const slot = w / Math.max(days.length, 1)
-  const bars = days
-    .map((d, i) => {
-      const bh = Math.max((d.usd / max) * (base - top), d.usd > 0 ? 2 : 0)
-      const x = i * slot + slot * 0.18
-      const isToday = i === days.length - 1
-      const fill = isToday ? '#d97757' : '#8b93a7'
-      const label =
-        i % 2 === days.length % 2 || isToday
-          ? `<text x="${x + slot * 0.32}" y="${h - 3}" font-size="9" text-anchor="middle" fill="#8b93a7">${d.day.slice(8)}</text>`
-          : ''
+  const h = 150
+  const many = rings.length > 2
+  const r = many ? 34 : 42
+  const sw = many ? 9 : 10
+  const big = many ? 18 : 21
+  const labelSize = many ? 11.5 : 12.5
+  const c = 2 * Math.PI * r
+  const slot = w / Math.max(rings.length, 1)
+  const body = rings
+    .map((g, i) => {
+      const cx = slot * i + slot / 2
+      const cy = 58
+      const shown = Math.max(0, Math.min(g.pct, 100))
+      const dash = (shown / 100) * c
+      const over = g.pct > 100
       return (
-        `<rect x="${x.toFixed(1)}" y="${(base - bh).toFixed(1)}" width="${(slot * 0.64).toFixed(1)}" ` +
-        `height="${bh.toFixed(1)}" rx="2" fill="${fill}" opacity="${isToday ? 1 : 0.75}"><title>${d.day}: ${money(d.usd)}</title></rect>` +
-        label
+        `<g><title>${esc(`${g.label}: ${Math.round(g.pct)}% · ${g.sub}`)}</title>` +
+        `<circle class="track" cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke-width="${sw}"/>` +
+        (dash > 0
+          ? `<circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="${statusHex(g.pct)}" stroke-width="${sw}" ` +
+            `stroke-linecap="round" stroke-dasharray="${dash.toFixed(1)} ${c.toFixed(1)}" ` +
+            `transform="rotate(-90 ${cx} ${cy})"/>`
+          : '') +
+        `<text class="ink" x="${cx}" y="${cy + 7}" font-size="${big}" font-weight="650" text-anchor="middle">` +
+        `${Math.round(g.pct)}%</text>` +
+        (over ? `<text x="${cx}" y="${cy + 22}" font-size="9" text-anchor="middle" fill="${CRIT}">over</text>` : '') +
+        `<text class="ink" x="${cx}" y="${cy + r + 24}" font-size="${labelSize}" font-weight="600" text-anchor="middle">${esc(g.label)}</text>` +
+        `<text class="sub" x="${cx}" y="${cy + r + 40}" font-size="${many ? 10 : 11}" text-anchor="middle">${esc(g.sub)}</text></g>`
       )
     })
     .join('')
-  const peak = `<text x="0" y="10" font-size="9" fill="#8b93a7">peak ${money(max)}</text>`
-  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}">${peak}${bars}</svg>`
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}">${STYLE}${body}</svg>`
+}
+
+/** 14 days of spend: bars with a 2px gap, today in the accent, a dashed average line. */
+export function dayChart(days: { day: string; usd: number }[]): string {
+  const w = 300
+  const h = 122
+  const top = 16
+  const base = h - 20
+  const max = Math.max(...days.map(d => d.usd), 0.01)
+  const active = days.filter(d => d.usd > 0)
+  const avg = active.length ? active.reduce((a, d) => a + d.usd, 0) / active.length : 0
+  const slot = w / Math.max(days.length, 1)
+  const bw = slot - 2
+  const y = (v: number) => base - (v / max) * (base - top)
+  const bars = days
+    .map((d, i) => {
+      const isToday = i === days.length - 1
+      const bh = d.usd > 0 ? Math.max(base - y(d.usd), 3) : 0
+      const x = i * slot + 1
+      const date = new Date(`${d.day}T12:00:00`)
+      const tip = esc(`${date.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })}: ${money(d.usd)}`)
+      const anchor = i === 0 ? 'start' : isToday ? 'end' : 'middle'
+      const lx = i === 0 ? x : isToday ? x + bw : x + bw / 2
+      const label =
+        i === 0 || isToday || i === Math.floor(days.length / 2)
+          ? `<text class="sub" x="${lx}" y="${h - 5}" font-size="9.5" text-anchor="${anchor}">` +
+            `${isToday ? 'today' : date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</text>`
+          : ''
+      return (
+        `<g><title>${tip}</title><rect x="${x}" y="${top - 4}" width="${slot}" height="${base - top + 4}" fill="transparent"/>` +
+        (bh ? `<path class="${isToday ? 'today' : 'bar'}" d="M${x},${base}v-${(bh - 3).toFixed(1)}q0,-3 3,-3h${(bw - 6).toFixed(1)}q3,0 3,3v${(bh - 3).toFixed(1)}z"/>` : '') +
+        `</g>${label}`
+      )
+    })
+    .join('')
+  const avgLine =
+    avg > 0
+      ? `<line class="avg" x1="0" x2="${w}" y1="${y(avg).toFixed(1)}" y2="${y(avg).toFixed(1)}" stroke-width="1" stroke-dasharray="3 3" opacity=".7"/>` +
+        `<text class="sub" x="${w}" y="${(y(avg) - 4).toFixed(1)}" font-size="9.5" text-anchor="end">avg ${money(avg)}/day</text>`
+      : ''
+  const axis = `<line class="grid" x1="0" x2="${w}" y1="${base + 0.5}" y2="${base + 0.5}" stroke-width="1"/>`
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}">${STYLE}${axis}${bars}${avgLine}</svg>`
 }
 
 let script = ''
@@ -221,8 +296,16 @@ export const register: Register = (on, options) => {
     const limits = mergeLimits(d, l, now)
     const plan = d?.billing === 'subscription' || limits.some(w => w.kind !== 'spend_limit')
 
-    const section = (title: string, ...children: unknown[]) => (
-      <Box flexDirection="column" gap="xs" marginBottom="md" key={`s-${title}`}>
+    const card = (title: string, ...children: unknown[]) => (
+      <Box
+        flexDirection="column"
+        gap="sm"
+        marginBottom="md"
+        padding="md"
+        borderStyle="round"
+        borderDimColor
+        key={`c-${title}`}
+      >
         <Text size="caption" weight="semibold" dimColor>
           {title.toUpperCase()}
         </Text>
@@ -232,159 +315,261 @@ export const register: Register = (on, options) => {
 
     const meter = (label: string, pct: number, valueText: string, key: string) =>
       hasProgress ? (
-        <els.Progress key={key} label={label} value={Math.min(pct, 100)} max={100} valueText={valueText} color={levelColor(pct)} />
+        <els.Progress
+          key={key}
+          label={label}
+          value={Math.min(Math.max(pct, 0), 100)}
+          max={100}
+          valueText={valueText}
+          color={levelColor(pct)}
+        />
       ) : (
-        <Text color={levelColor(pct)}>
+        <Text color={levelColor(pct)} key={key}>
           {label} {'▓'.repeat(Math.round(Math.min(pct, 100) / 10))}
           {'░'.repeat(10 - Math.round(Math.min(pct, 100) / 10))} {valueText}
         </Text>
       )
 
-    const limitRows = limits.map(w => {
-      const value =
-        w.kind === 'spend_limit' && w.limit_usd
-          ? `${money(w.used_usd)} of ${money(w.limit_usd)}${w.period ? ` ${w.period}` : ''} · ${Math.round(w.pct)}%`
-          : `${Math.round(w.pct)}%${w.until ? ` · resets in ${w.until}` : ''}`
-      return (
-        <Box flexDirection="column" key={w.kind}>
-          {meter(w.label, w.pct, value, `m-${w.kind}`)}
-          {w.pace && w.pct < 100 && (
-            <Text size="footnote" color={w.pace.before_reset ? 'warning' : 'subtle'}>
-              {w.pace.before_reset
-                ? `At this pace it's full around ${w.pace.full_when}, before it resets`
-                : `At this pace it lasts until it resets${w.resets_when ? ` (${w.resets_when})` : ''}`}
-            </Text>
-          )}
-        </Box>
-      )
-    })
-
-    const ctxPct = l.contextPercent ?? (d && l.contextWindow ? (d.session.ctx / l.contextWindow) * 100 : null)
-    const tips: Tip[] = d?.tips ?? []
+    const tile = (caption: string, value: string, note: string | null, color?: string) => (
+      <Box flexDirection="column" flexGrow={1} minWidth={84} padding="sm" borderStyle="round" borderDimColor key={`t-${caption}`}>
+        <Text size="caption" dimColor>
+          {caption}
+        </Text>
+        <Text size="heading" weight="semibold" tabular color={color}>
+          {value}
+        </Text>
+        {note && (
+          <Text size="caption" dimColor>
+            {note}
+          </Text>
+        )}
+      </Box>
+    )
 
     const blocks: unknown[] = []
     if (s.error) {
       blocks.push(
-        <Box marginBottom="md" key="err">
+        <Box marginBottom="md" padding="sm" borderStyle="round" borderColor="error" key="err">
           <Text color="error">Cost Guard data unavailable: {s.error}</Text>
         </Box>,
       )
     }
-    if (limits.length > 0) {
-      blocks.push(section(plan ? 'Plan limits' : 'Spend limit', ...limitRows))
+
+    // 1. The headline: plan limits, or the caps on an API key.
+    const rings: Ring[] = []
+    const ringRows: unknown[] = []
+    if (limits.length) {
+      for (const w of limits) {
+        const sub =
+          w.kind === 'spend_limit' && w.limit_usd
+            ? `${money(w.used_usd)} of ${money(w.limit_usd)}`
+            : w.until
+              ? `resets in ${w.until}`
+              : 'reset time unknown'
+        rings.push({ label: w.kind === 'five_hour' ? '5-hour' : w.kind === 'seven_day' ? 'Weekly' : 'Spend limit', pct: w.pct, sub })
+        if (!hasSvg) ringRows.push(meter(w.label, w.pct, `${Math.round(w.pct)}% · ${sub}`, `m-${w.kind}`))
+        if (w.pace && w.pct < 100) {
+          ringRows.push(
+            <Text size="footnote" color={w.pace.before_reset ? 'warning' : 'subtle'} key={`pace-${w.kind}`}>
+              {w.pace.before_reset ? '▲ ' : '✓ '}
+              {w.label}:{' '}
+              {w.pace.before_reset
+                ? `at this pace it's full around ${w.pace.full_when}, before it resets`
+                : `at this pace it lasts until it resets${w.resets_when ? ` (${w.resets_when})` : ''}`}
+            </Text>,
+          )
+        }
+      }
     } else if (d) {
-      blocks.push(
-        section(
-          'Limits',
-          <Text size="footnote" dimColor>
-            {d.billing === 'api'
-              ? 'Pay-per-token account: no 5-hour or weekly limits. The caps below are Cost Guard’s own.'
-              : 'No limit reading yet: it appears after the first reply in this session.'}
+      rings.push({ label: 'Today', pct: (d.today / d.caps.daily) * 100, sub: `${money(d.today)} of ${money(d.caps.daily)}` })
+      if (d.month !== null) {
+        rings.push({ label: 'This month', pct: (d.month / d.caps.monthly) * 100, sub: `${money(d.month)} of ${money(d.caps.monthly)}` })
+      }
+      if (!hasSvg) for (const g of rings) ringRows.push(meter(g.label, g.pct, g.sub, `m-${g.label}`))
+      if (d.month !== null && d.month > d.caps.monthly) {
+        ringRows.push(
+          <Text size="footnote" color="error" key="over">
+            ▲ Over the monthly budget by {money(d.month - d.caps.monthly)}. Cost Guard warns once a day
+            {d.caps.monthly_hard_stop ? ' and stops new prompts' : ''}.
           </Text>,
+        )
+      }
+    }
+    if (rings.length) {
+      blocks.push(
+        card(
+          limits.length ? (plan ? 'Plan limits' : 'Spend limit') : 'Budget',
+          hasSvg && (
+            <Box alignItems="center" key="rings">
+              <els.Svg
+                source={ringsSvg(rings)}
+                alt={rings.map(g => `${g.label} ${Math.round(g.pct)}% (${g.sub})`).join('; ')}
+                isInteractive
+              />
+            </Box>
+          ),
+          ...ringRows,
+          !limits.length && d && (
+            <Text size="caption" dimColor key="api-note">
+              API key: no 5-hour or weekly limits. These are Cost Guard’s own caps.
+            </Text>
+          ),
         ),
       )
     }
+
     if (d) {
+      // 2. This session at a glance.
+      const ctxPct = l.contextPercent ?? (l.contextWindow ? (d.session.ctx / l.contextWindow) * 100 : null)
+      const hot = d.session.last_15min >= 7.5
       blocks.push(
-        section(
-          'This session',
-          <Box flexDirection="row" gap="md" flexWrap="wrap">
-            <Text weight="semibold" tabular>
-              {money(d.session.usd)}
-              {plan ? ' API value' : ''}
-            </Text>
-            {d.session.rate_per_h >= 1 && (
-              <Text tabular color={d.session.last_15min >= 7.5 ? 'warning' : 'subtle'}>
-                {money(d.session.rate_per_h)}/h
-              </Text>
-            )}
-            {d.session.cache_cold && <Text color="warning">cache cold</Text>}
-            {d.session.model && <Text dimColor>{d.session.model.replace('claude-', '')}</Text>}
-          </Box>,
-          ctxPct !== null &&
-            meter('Context', ctxPct, `${Math.round(d.session.ctx / 1000)}k tokens · ${Math.round(ctxPct)}%`, 'ctx'),
-          ...d.advice.slice(0, 2).map((a, i) => (
-            <Text key={`adv-${i}`} size="footnote" dimColor>
-              • {a}
-            </Text>
-          )),
-        ),
+        <Box flexDirection="row" gap="sm" flexWrap="wrap" marginBottom="md" key="tiles">
+          {tile('Session', money(d.session.usd), plan ? 'API value' : `cap ${money(d.caps.session)}`)}
+          {tile('Spend rate', d.session.rate_per_h >= 0.5 ? `${money(d.session.rate_per_h)}/h` : 'idle', hot ? 'running hot' : 'last 30 min', hot ? 'warning' : undefined)}
+          {tile(
+            'Context',
+            ctxPct !== null ? `${Math.round(ctxPct)}%` : `${Math.round(d.session.ctx / 1000)}k`,
+            d.session.cache_cold ? 'cache cold' : `${Math.round(d.session.ctx / 1000)}k tokens`,
+            ctxPct !== null ? levelColor(ctxPct) : undefined,
+          )}
+        </Box>,
       )
-      if (!plan) {
+      if (d.advice.length) {
         blocks.push(
-          section(
-            'Budget',
-            meter('Today', (d.today / d.caps.daily) * 100, `${money(d.today)} of ${money(d.caps.daily)}`, 'today'),
-            d.month !== null &&
-              meter('Month', (d.month / d.caps.monthly) * 100, `${money(d.month)} of ${money(d.caps.monthly)}`, 'month'),
+          card(
+            'Right now',
+            ...d.advice.slice(0, 2).map((a, i) => (
+              <Text key={`adv-${i}`} size="footnote">
+                <Text color="claude">● </Text>
+                {a}
+              </Text>
+            )),
           ),
         )
       }
+
+      // 3. Fourteen days and where it went.
+      const total = d.by_day.reduce((a, x) => a + x.usd, 0)
       blocks.push(
-        section(
-          plan ? 'Usage, 14 days (API value)' : 'Spend, 14 days',
+        card(
+          plan ? 'Last 14 days · API value' : 'Last 14 days',
+          <Box flexDirection="row" gap="md" key="totals">
+            <Text size="title" weight="semibold" tabular>
+              {money(total)}
+            </Text>
+            <Text size="footnote" dimColor>
+              {d.month !== null ? `${money(d.month)} this month` : 'month still being counted'}
+            </Text>
+          </Box>,
           hasSvg ? (
             <els.Svg
+              key="chart"
               source={dayChart(d.by_day)}
               alt={`Spend per day: ${d.by_day.map(x => `${x.day} ${money(x.usd)}`).join(', ')}`}
               isInteractive
             />
           ) : (
-            <Text dimColor>Last 7 days: {d.by_day.slice(-7).map(x => money(x.usd)).join(' · ')}</Text>
+            <Text dimColor key="chart">
+              Last 7 days: {d.by_day.slice(-7).map(x => money(x.usd)).join(' · ')}
+            </Text>
           ),
-          ...d.by_project.slice(0, 4).map(p => (
-            <Box flexDirection="row" justifyContent="space-between" key={`p-${p.key}`}>
-              <Text wrap="truncate-middle">{p.name}</Text>
-              <Text tabular dimColor>
-                {money(p.usd)}
-              </Text>
-            </Box>
-          )),
         ),
       )
-      blocks.push(
-        section(
-          'Top ways to save',
-          d.tips === null && <Text dimColor>Looking through your last 14 days…</Text>,
-          d.tips !== null && tips.length === 0 && <Text dimColor>Nothing stands out.</Text>,
-          ...tips.map((t, i) => (
-            <Box flexDirection="column" key={`tip-${i}`} gap="xs">
-              <Text size="footnote">
-                <Text weight="semibold">≈{money(t.usd)}/2 wk </Text>
-                {t.text}
-              </Text>
-              {t.fixable && (
-                <Button
-                  key={`fix-${t.key}`}
-                  label="Review and apply…"
-                  variant="secondary"
-                  onPress={() => void $.command.run({ command: 'cost-guard:fix' })}
+      const monthTotal = d.month ?? d.by_project.reduce((a, p) => a + p.usd, 0)
+      if (d.by_project.length) {
+        blocks.push(
+          card(
+            'Top projects this month',
+            ...d.by_project.slice(0, 4).map(p => {
+              const share = monthTotal > 0 ? (p.usd / monthTotal) * 100 : 0
+              return hasProgress ? (
+                <els.Progress
+                  key={`p-${p.key}`}
+                  label={p.name}
+                  value={share}
+                  max={100}
+                  valueText={`${money(p.usd)} · ${Math.round(share)}%`}
+                  color="suggestion"
                 />
+              ) : (
+                <Box flexDirection="row" justifyContent="space-between" key={`p-${p.key}`}>
+                  <Text wrap="truncate-middle">{p.name}</Text>
+                  <Text tabular dimColor>
+                    {money(p.usd)} · {Math.round(share)}%
+                  </Text>
+                </Box>
+              )
+            }),
+          ),
+        )
+      }
+
+      // 4. What to change.
+      const tips: Tip[] = d.tips ?? []
+      blocks.push(
+        card(
+          'Ways to save',
+          d.tips === null && (
+            <Text dimColor key="t-wait">
+              Looking through your last 14 days…
+            </Text>
+          ),
+          d.tips !== null && tips.length === 0 && (
+            <Text dimColor key="t-none">
+              ✓ Nothing stands out: what goes out with each message gets used.
+            </Text>
+          ),
+          ...tips.map((t, i) => (
+            <Box flexDirection="column" gap="xs" key={`tip-${i}`}>
+              <Box flexDirection="row" gap="sm" alignItems="center">
+                <Text size="caption" weight="semibold" color="success">
+                  SAVE ≈{money(t.usd)} / 2 WK
+                </Text>
+                {t.fixable && (
+                  <Text size="caption" dimColor>
+                    · one-step fix
+                  </Text>
+                )}
+              </Box>
+              <Text size="footnote">{t.text}</Text>
+              {t.fixable && (
+                <Box key={`fixrow-${i}`}>
+                  <Button
+                    key={`fix-${t.key}`}
+                    label="Review and apply…"
+                    variant="secondary"
+                    onPress={() => void $.command.run({ command: 'cost-guard:fix' })}
+                  />
+                </Box>
               )}
             </Box>
           )),
         ),
       )
     }
+
     const mode = d
-      ? ` · ${d.billing === 'subscription' ? 'Pro/Max plan' : d.billing === 'gateway' ? 'company gateway' : 'API key'}`
-      : ''
+      ? d.billing === 'subscription'
+        ? 'Pro/Max plan'
+        : d.billing === 'gateway'
+          ? 'Company gateway'
+          : 'API key'
+      : null
 
     return (
       <Box flexDirection="column" padding="sm">
-        {blocks}
-        <Box flexDirection="row" gap="sm" alignItems="center">
-          <Button
-            key="refresh"
-            label={s.isLoading ? 'Refreshing…' : 'Refresh'}
-            variant="secondary"
-            onPress={() => void refresh($, true)}
-          />
-          <Text size="caption" dimColor>
-            {s.updatedAt ? `Updated ${new Date(s.updatedAt).toTimeString().slice(0, 5)}` : 'Loading…'}
-            {mode}
+        <Box flexDirection="row" justifyContent="space-between" alignItems="center" marginBottom="md">
+          <Text size="footnote" dimColor>
+            {mode ? `${mode} · ` : ''}
+            {s.isLoading
+              ? 'refreshing…'
+              : s.updatedAt
+                ? `updated ${new Date(s.updatedAt).toTimeString().slice(0, 5)}`
+                : 'loading…'}
           </Text>
+          <Button key="refresh" label="Refresh" variant="secondary" onPress={() => void refresh($, true)} />
         </Box>
+        {blocks}
       </Box>
     )
   })

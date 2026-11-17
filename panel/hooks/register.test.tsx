@@ -71,14 +71,16 @@ test('the pane shows both plan limits, the pace and three tips', async ($, on) =
   await $.command.run({ command: 'cost-panel' })
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  // Outside mobile a Progress is drawn as Box and Text: its label is text.
-  expect(await ui.find({ type: 'Text', text: /5-hour limit/ })).toBeTruthy()
-  expect(await ui.find({ type: 'Text', text: /Weekly limit/ })).toBeTruthy()
-  expect(await ui.find({ type: 'Text', text: /resets in 1h3\d|resets in 1h4\d/ })).toBeTruthy()
-  expect(await ui.find({ type: 'Text', text: /full around Wed 14:00/ })).toBeTruthy()
+  // The limits are ring gauges in one Svg; its alt text names each one.
+  const drawn = JSON.stringify(await ui.drawn())
+  expect(drawn).toContain('5-hour 62% (resets in 1h')
+  expect(drawn).toContain('Weekly 41% (resets in 3d 2h)')
+  expect(drawn).toContain('stroke-dasharray')
+  expect(await ui.find({ type: 'Text', text: /Weekly limit: at this pace it's full around Wed 14:00/ })).toBeTruthy()
   expect(await ui.find({ type: 'Text', text: /Trim CLAUDE.md/ })).toBeTruthy()
   expect((await ui.findAll({ type: 'Button', text: /Review and apply/ })).length).toBe(2)
-  expect(await ui.find({ type: 'Svg' })).toBeTruthy()
+  expect((await ui.findAll({ type: 'Svg' })).length).toBe(2)
+  expect(await ui.find({ type: 'Text', text: /Top projects this month/i })).toBeTruthy()
 
   // The live reading is handed to the hooks, then the data is read.
   expect(calls.some(argv => argv.includes('record-limits'))).toBe(true)
