@@ -25,7 +25,7 @@ TMP = tempfile.mkdtemp(prefix="cost-guard-test-")
 HOME = os.path.join(TMP, "home")
 DATA = os.path.join(TMP, "data")
 BIN = os.path.join(TMP, "bin")
-os.environ.update(HOME=HOME, CLAUDE_PLUGIN_DATA=DATA)
+os.environ.update(HOME=HOME, CLAUDE_PLUGIN_DATA=DATA, COST_GUARD_NO_BACKGROUND="1")
 for key in [k for k in os.environ if k.startswith("CLAUDE_PLUGIN_OPTION_")]:
     del os.environ[key]
 
@@ -97,7 +97,7 @@ class Base(unittest.TestCase):
     def setUp(self):
         for d in (HOME, DATA, BIN, PROJ):
             shutil.rmtree(d, ignore_errors=True)
-            os.makedirs(d)
+            os.makedirs(d, exist_ok=True)
         cg._HOOK_OWNERS = None
         set_overrides()
 
@@ -296,7 +296,7 @@ class Reports(Base):
         self.assertEqual(data["rows"][0]["key"], OPUS)
 
 
-def plan_reading(five=None, week=None, spend=None, resets_in=3 * 3600, ts=None):
+def plan_reading(five=None, week=None, spend=None, resets_in=3 * 3600, ts=None, sid="s1"):
     """Record a status-line style rate_limits reading."""
     raw, reset = {}, time.time() + resets_in
     if five is not None:
@@ -305,7 +305,7 @@ def plan_reading(five=None, week=None, spend=None, resets_in=3 * 3600, ts=None):
         raw["seven_day"] = {"used_percentage": week, "resets_at": reset + 3 * 86400}
     if spend is not None:
         raw["spend_limit"] = dict({"resets_at": reset + 10 * 86400}, **spend)
-    return cg.record_limits(raw, "test", now=ts)
+    return cg.record_limits(raw, "test", now=ts, session_id=sid)
 
 
 class PlanLimits(Base):
@@ -313,7 +313,8 @@ class PlanLimits(Base):
         set_overrides(session_cap_usd=1, daily_cap_usd=1, monthly_cap_usd=1, monthly_hard_stop="true",
                       warn_at_usd="100", context_warn_k=100000, burst_usd_per_15min=0)
         plan_reading(five=10, week=20)
-        self.assertEqual(cg.billing_mode(cg.load_config(), cg.load_limits()), "subscription")
+        self.assertEqual(cg.billing_mode(cg.load_config(), cg.load_limits(), "s1"), "subscription")
+        self.assertEqual(cg.billing_mode(cg.load_config(), cg.load_limits(), "other"), "api")
         path = write_transcript("s1", [assistant("m1", usd_input_tokens=50_000_000)])  # $200
         block, warn = hook(path)
         self.assertIsNone(block)
@@ -335,6 +336,18 @@ class PlanLimits(Base):
         plan_reading(five=10, week=85, resets_in=4 * 3600)  # a new window instance
         self.assertIn("weekly limit 85% used", hook(path)[1])
 
+    def test_a_plan_session_elsewhere_leaves_an_api_session_alone(self):
+        set_overrides(session_cap_usd=1, warn_at_usd="100", context_warn_k=100000)
+        plan_reading(five=90, week=20, sid="desktop-session")
+        path = write_transcript("s1", [assistant("m1", usd_input_tokens=500_000)])  # $2, an API session
+        block, _ = hook(path)
+        self.assertIn("cost-guard stopped this", block)  # its dollar cap still applies
+        stdin = {"transcript_path": path, "session_id": "s1"}
+        out = subprocess.run([sys.executable, SCRIPT, "statusline"], capture_output=True, text=True,
+                             env=dict(os.environ), input=json.dumps(stdin)).stdout
+        self.assertNotIn("5h", out)
+        self.assertIn("session $", out)
+
     def test_pace_predicts_when_the_window_fills(self):
         now = time.time()
         reset = now + 4 * 3600
@@ -349,11 +362,12 @@ class PlanLimits(Base):
         set_overrides(context_warn_k=100000, warn_at_usd="100")
         path = write_transcript("s1", [assistant("m1", usd_input_tokens=1000)])
         plan_reading(spend={"used_percentage": 84, "used_usd": 252, "limit_usd": 300, "period": "monthly"})
-        self.assertEqual(cg.billing_mode(cg.load_config(), cg.load_limits()), "gateway")
+        self.assertEqual(cg.billing_mode(cg.load_config(), cg.load_limits(), "s1"), "gateway")
         block, warn = hook(path)
         self.assertIsNone(block)
         self.assertIn("company spend limit $252.00 of $300.00 monthly", warn)
-        plan_reading(spend={"used_percentage": 101, "used_usd": 303, "limit_usd": 300})
+        for sid in ("s2", "s3"):
+            plan_reading(spend={"used_percentage": 101, "used_usd": 303, "limit_usd": 300}, sid=sid)
         self.assertIsNone(hook(path, sid="s2")[0])
         set_overrides(context_warn_k=100000, warn_at_usd="100", monthly_hard_stop="true")
         self.assertIn("spend limit", hook(path, sid="s3")[0])
@@ -363,7 +377,7 @@ class PlanLimits(Base):
 
     def test_record_limits_accepts_the_desktop_list_and_drops_reset_windows(self):
         reset_iso = datetime.fromtimestamp(time.time() + 3600, timezone.utc).isoformat()
-        done = subprocess.run([sys.executable, SCRIPT, "record-limits"], capture_output=True, text=True,
+        done = subprocess.run([sys.executable, SCRIPT, "record-limits", "--session", "d1"], capture_output=True, text=True,
                               env=dict(os.environ), input=json.dumps(
                                   [{"kind": "five_hour", "percentUsed": 23.5, "resetsAt": reset_iso},
                                    {"kind": "seven_day", "percentUsed": 41, "resetsAt": "2000-01-01T00:00:00Z"}]))
@@ -371,6 +385,7 @@ class PlanLimits(Base):
         lim = cg.load_limits()
         self.assertEqual(lim["kinds"], ["five_hour", "seven_day"])
         self.assertEqual(list(lim["windows"]), ["five_hour"])  # the weekly one already reset
+        self.assertEqual(cg.billing_mode(cg.load_config(), lim, "d1"), "subscription")
         self.assertAlmostEqual(lim["windows"]["five_hour"]["resets_at"], time.time() + 3600, delta=5)
 
     def test_panel_json_shape(self):
@@ -390,7 +405,7 @@ class PlanLimits(Base):
 
     def test_status_line_shows_plan_bars_and_records_the_reading(self):
         path = write_transcript("s1", [assistant("m1", usd_input_tokens=1_000_000)])
-        stdin = {"transcript_path": path, "model": {"display_name": "Opus 5.5"},
+        stdin = {"transcript_path": path, "session_id": "s1", "model": {"display_name": "Opus 5.5"},
                  "rate_limits": {"five_hour": {"used_percentage": 62, "resets_at": time.time() + 6000},
                                  "seven_day": {"used_percentage": 41, "resets_at": time.time() + 4 * 86400}}}
         done = subprocess.run([sys.executable, SCRIPT, "statusline"], capture_output=True, text=True,

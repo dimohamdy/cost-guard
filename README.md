@@ -55,7 +55,43 @@ desktop app. It shows:
 - the top 3 ways to save. Each fixable tip has a **Review and apply…** button that opens
   `/cost-guard:fix`, which still asks before changing anything.
 
-The pane refreshes after each reply and every minute. `/cost-panel` reopens it.
+The pane refreshes after each reply and every minute. `/cost-panel` reopens it. When the
+desktop app shrinks the pane to a widget, it shows just the rings.
+
+### In the terminal
+
+The same plugin draws a text version in the terminal (`claude`, not the desktop app):
+
+```
+◆ Cost Guard · Pro/Max plan · updated 00:53            [Refresh]
+
+5-hour  ███████████████░░░░░░░░░  62%  resets in 1h39
+Weekly  ██████████░░░░░░░░░░░░░░  41%  resets in 3d 2h
+        ▲ full around Wed 14:00 at this pace, before it resets
+Session $12.50 API value  $8.00/h  ctx 120k 60%
+
+14 days ·▂▂▃▃▄▄▅▅▆▆▇▇█  $91.00 · avg $7.00/day
+        Nov 5        ▲ today
+
+Top projects this month
+app                █████░░░░░░░░░░░░░░░░░░░  19%  $40.00
+
+Ways to save
+1. ≈$9.50 Trim CLAUDE.md
+2. ≈$3.90 Disable plugin x
+```
+
+- **Where the pane appears:** it docks beside the chat in fullscreen at 110+ columns, and
+  sits above the prompt (in a shorter form) otherwise. `/cost-panel` opens it at any width;
+  it opens by itself only at 144+ columns.
+- **The alert line:** when something needs attention, a single line appears above the
+  prompt in the terminal and the desktop app. That happens when a limit passes 80%, when
+  spending runs hot, or when the month is over budget, for example
+  `◆ Cost Guard: 5-hour limit at 86% · resets in 1h39 [Details] [Hide]`. **Hide** dismisses
+  that alert until something changes.
+
+Billing is decided per session. If a desktop session reports Pro/Max limits, a terminal
+session on an API key still keeps its dollar caps.
 
 To get past a stop, put `#override` in your message. That adds one more cap-sized allowance.
 The plugin never blocks the app's own bookkeeping tools (task list, wrap-up, plan mode). You can

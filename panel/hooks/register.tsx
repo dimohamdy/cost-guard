@@ -24,6 +24,10 @@ const status = atom(
   { shape: 'status-1' },
 )
 
+const bandHidden = atom({ plugin: 'cost-guard-panel', key: 'bandHidden' } as const, '' as string, {
+  shape: 'band-1',
+})
+
 const LABELS: Record<string, string> = {
   five_hour: '5-hour limit',
   seven_day: 'Weekly limit',
@@ -182,6 +186,53 @@ export function dayChart(days: { day: string; usd: number }[]): string {
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}">${STYLE}${axis}${bars}${avgLine}</svg>`
 }
 
+// ---------- text drawings (terminal) ----------
+
+const SPARK = '▁▂▃▄▅▆▇█'
+
+/** One block character per value, scaled to the largest; zero days draw as a dot. */
+export function sparkline(values: number[]): string {
+  const max = Math.max(...values, 0)
+  return values
+    .map(v => (v <= 0 || max <= 0 ? '·' : SPARK[Math.min(SPARK.length - 1, Math.floor((v / max) * (SPARK.length - 1) + 0.5))]))
+    .join('')
+}
+
+export function pad(text: string, width: number): string {
+  return text.length > width ? `${text.slice(0, width - 1)}…` : text.padEnd(width)
+}
+
+/** The one thing worth a line above the prompt, or null when all is calm. */
+export function attention(
+  d: PanelData | null,
+  limits: { kind: string; label: string; pct: number; until: string | null }[],
+): { key: string; text: string; color: 'error' | 'warning' } | null {
+  const hot = [...limits].sort((a, b) => b.pct - a.pct).find(w => w.pct >= 80)
+  if (hot) {
+    const level = hot.pct >= 95 ? 95 : 80
+    return {
+      key: `${hot.kind}:${level}`,
+      text: `${hot.label} at ${Math.round(hot.pct)}%${hot.until ? ` · resets in ${hot.until}` : ''}`,
+      color: hot.pct >= 95 ? 'error' : 'warning',
+    }
+  }
+  if (d && d.session.last_15min >= 7.5) {
+    return {
+      key: `burst:${new Date().toISOString().slice(0, 13)}`,
+      text: `Spending fast: ${money(d.session.last_15min)} in 15 min (${money(d.session.rate_per_h)}/h)`,
+      color: 'warning',
+    }
+  }
+  if (d && !limits.length && d.month !== null && d.month > d.caps.monthly) {
+    return {
+      key: `month:${new Date().toISOString().slice(0, 10)}`,
+      text: `Month ${money(d.month)} of ${money(d.caps.monthly)} budget (${Math.round((d.month / d.caps.monthly) * 100)}%)`,
+      color: 'error',
+    }
+  }
+  return null
+}
+
 let script = ''
 let scriptOption = ''
 let lastRun = 0
@@ -230,14 +281,14 @@ async function refresh($: any, force = false) {
     return
   }
   try {
+    const sid = await $.session.id()
     if (rateLimits.length) {
-      // The hooks can't see plan limits in the app: hand them the reading.
-      await $.process.run(['python3', path, 'record-limits'], {
+      // The hooks can't see plan limits in the app: hand them the reading, for this session.
+      await $.process.run(['python3', path, 'record-limits', '--session', sid], {
         stdin: JSON.stringify(rateLimits),
         timeoutMs: 5000,
       })
     }
-    const sid = await $.session.id()
     const r = await $.process.run(['python3', path, 'panel-json', '--session', sid], { timeoutMs: 10_000 })
     if (r.exitCode !== 0) throw new Error((r.stderr || r.stdout || 'no output').trim().split('\n').pop())
     const parsed = JSON.parse(r.stdout) as PanelData
@@ -295,6 +346,208 @@ export const register: Register = (on, options) => {
     const now = Date.now()
     const limits = mergeLimits(d, l, now)
     const plan = d?.billing === 'subscription' || limits.some(w => w.kind !== 'spend_limit')
+
+    const mode = d
+      ? d.billing === 'subscription'
+        ? 'Pro/Max plan'
+        : d.billing === 'gateway'
+          ? 'Company gateway'
+          : 'API key'
+      : null
+    const updated = s.isLoading
+      ? 'refreshing…'
+      : s.updatedAt
+        ? `updated ${new Date(s.updatedAt).toTimeString().slice(0, 5)}`
+        : 'loading…'
+    // The headline gauges, the same on every surface: plan limits, else Cost Guard's caps.
+    const gauges: { key: string; label: string; pct: number; note: string }[] = limits.length
+      ? limits.map(w => ({
+          key: w.kind,
+          label: w.kind === 'five_hour' ? '5-hour' : w.kind === 'seven_day' ? 'Weekly' : 'Spend limit',
+          pct: w.pct,
+          note:
+            w.kind === 'spend_limit' && w.limit_usd
+              ? `${money(w.used_usd)} of ${money(w.limit_usd)}`
+              : w.until
+                ? `resets in ${w.until}`
+                : '',
+        }))
+      : d
+        ? [
+            { key: 'today', label: 'Today', pct: (d.today / d.caps.daily) * 100, note: `${money(d.today)} of ${money(d.caps.daily)}` },
+            ...(d.month !== null
+              ? [{ key: 'month', label: 'Month', pct: (d.month / d.caps.monthly) * 100, note: `${money(d.month)} of ${money(d.caps.monthly)}` }]
+              : []),
+          ]
+        : []
+
+    // The desktop app's minimized pane: a glance, clicks may not reach it.
+    if (e.props.placement === 'widget') {
+      return (
+        <Box flexDirection="column" alignItems="center" padding="xs">
+          {hasSvg && gauges.length ? (
+            <els.Svg
+              source={ringsSvg(gauges.map(g => ({ label: g.label, pct: g.pct, sub: g.note })))}
+              alt={gauges.map(g => `${g.label} ${Math.round(g.pct)}%`).join('; ')}
+            />
+          ) : (
+            <Text dimColor>{s.error ? 'Cost Guard: no data' : 'Cost Guard: loading…'}</Text>
+          )}
+        </Box>
+      )
+    }
+
+    if (e.surface === 'terminal') {
+      const cols = Math.max(e.props.bodyColumns ?? 60, 30)
+      const inline = e.props.placement === 'inline'
+      const barW = Math.max(8, Math.min(24, cols - 34))
+      const tbar = (pct: number, key: string, color?: string) => {
+        const f = Math.round((Math.min(Math.max(pct, 0), 100) / 100) * barW)
+        return [
+          <Text key={`${key}-f`} color={color ?? levelColor(pct)}>
+            {'█'.repeat(f)}
+          </Text>,
+          <Text key={`${key}-e`} dimColor>
+            {'░'.repeat(barW - f)}
+          </Text>,
+        ]
+      }
+      const gaugeRow = (g: { key: string; label: string; pct: number; note: string }) => (
+        <Text key={`g-${g.key}`} wrap="truncate-end">
+          {pad(g.label, 8)}
+          {tbar(g.pct, g.key)}
+          <Text bold color={levelColor(g.pct)}>
+            {` ${String(Math.round(g.pct)).padStart(3)}%`}
+          </Text>
+          <Text dimColor>{`  ${g.note}`}</Text>
+          {g.pct > 100 ? <Text color="error"> ▲ over</Text> : ''}
+        </Text>
+      )
+      const rows: unknown[] = []
+      rows.push(
+        <Box flexDirection="row" justifyContent="space-between" key="head">
+          <Text wrap="truncate-end">
+            <Text bold color="claude">
+              ◆ Cost Guard
+            </Text>
+            <Text dimColor>{` · ${mode ? `${mode} · ` : ''}${updated}`}</Text>
+          </Text>
+          <Button key="refresh" label="Refresh" onPress={() => void refresh($, true)} />
+        </Box>,
+      )
+      if (s.error) rows.push(<Text key="err" color="error" wrap="wrap">{`✗ ${s.error}`}</Text>)
+      rows.push(<Text key="sp0"> </Text>)
+      for (const g of gauges) rows.push(gaugeRow(g))
+      for (const w of limits) {
+        if (w.pace && w.pct < 100 && w.pace.before_reset) {
+          rows.push(
+            <Text key={`pace-${w.kind}`} color="warning" wrap="truncate-end">
+              {`        ▲ full around ${w.pace.full_when} at this pace, before it resets`}
+            </Text>,
+          )
+        }
+      }
+      if (d) {
+        const ctxPct = l.contextPercent ?? (l.contextWindow ? (d.session.ctx / l.contextWindow) * 100 : null)
+        rows.push(
+          <Text key="session" wrap="truncate-end">
+            {pad('Session', 8)}
+            <Text bold>{money(d.session.usd)}</Text>
+            <Text dimColor>{plan ? ' API value' : ''}</Text>
+            {d.session.rate_per_h >= 0.5 ? (
+              <Text color={d.session.last_15min >= 7.5 ? 'warning' : undefined}>{`  ${money(d.session.rate_per_h)}/h`}</Text>
+            ) : (
+              ''
+            )}
+            <Text color={ctxPct !== null ? levelColor(ctxPct) : undefined}>
+              {`  ctx ${Math.round(d.session.ctx / 1000)}k${ctxPct !== null ? ` ${Math.round(ctxPct)}%` : ''}`}
+            </Text>
+            {d.session.cache_cold ? <Text color="warning">  cache cold</Text> : ''}
+          </Text>,
+        )
+        if (!inline) {
+          const values = d.by_day.map(x => x.usd)
+          const line = sparkline(values)
+          const active = values.filter(v => v > 0)
+          const avg = active.length ? active.reduce((a, v) => a + v, 0) / active.length : 0
+          const total = values.reduce((a, v) => a + v, 0)
+          rows.push(<Text key="sp1"> </Text>)
+          rows.push(
+            <Text key="spark" wrap="truncate-end">
+              {pad('14 days', 8)}
+              <Text color="suggestion">{line.slice(0, -1)}</Text>
+              <Text color="claude" bold>
+                {line.slice(-1)}
+              </Text>
+              <Text dimColor>{`  ${money(total)} · avg ${money(avg)}/day`}</Text>
+            </Text>,
+          )
+          const first = new Date(`${d.by_day[0]?.day ?? ''}T12:00:00`)
+          const startLabel = isNaN(first.getTime()) ? '' : first.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+          rows.push(
+            <Text key="axis" dimColor>
+              {`${' '.repeat(8)}${startLabel.padEnd(Math.max(line.length - 1, startLabel.length + 1))}▲ today`}
+            </Text>,
+          )
+          if (d.by_project.length) {
+            const monthTotal = d.month ?? d.by_project.reduce((a, p) => a + p.usd, 0)
+            const nameW = Math.max(10, Math.min(22, cols - barW - 18))
+            rows.push(<Text key="sp2"> </Text>)
+            rows.push(
+              <Text key="proj-h" dimColor bold>
+                Top projects this month
+              </Text>,
+            )
+            for (const p of d.by_project.slice(0, 3)) {
+              const share = monthTotal > 0 ? (p.usd / monthTotal) * 100 : 0
+              rows.push(
+                <Text key={`p-${p.key}`} wrap="truncate-end">
+                  {pad(p.name, nameW)}
+                  {' '}
+                  {tbar(share, `p-${p.key}`, 'suggestion')}
+                  <Text dimColor>{` ${String(Math.round(share)).padStart(3)}%  ${money(p.usd)}`}</Text>
+                </Text>,
+              )
+            }
+          }
+          const tips: Tip[] = d.tips ?? []
+          rows.push(<Text key="sp3"> </Text>)
+          rows.push(
+            <Text key="tips-h" dimColor bold>
+              Ways to save
+            </Text>,
+          )
+          if (d.tips === null) rows.push(<Text key="t-wait" dimColor>Looking through your last 14 days…</Text>)
+          if (d.tips !== null && !tips.length) rows.push(<Text key="t-none" color="success">✓ Nothing stands out.</Text>)
+          tips.forEach((t, i) => {
+            rows.push(
+              <Text key={`tip-${i}`} wrap="wrap">
+                <Text bold color="success">{`${i + 1}. ≈${money(t.usd)} `}</Text>
+                {t.text}
+              </Text>,
+            )
+          })
+          if (tips.some(t => t.fixable)) {
+            rows.push(
+              <Box key="fix" marginTop={1}>
+                <Button key="fix-all" label="Review fixes…" onPress={() => void $.command.run({ command: 'cost-guard:fix' })} />
+              </Box>,
+            )
+          }
+        } else if (d.tips?.length) {
+          rows.push(
+            <Text key="t-inline" dimColor wrap="truncate-end">
+              {`${d.tips.length} ways to save ≈${money(d.tips.reduce((a, t) => a + t.usd, 0))} / 2 wk · /cost-guard:insights`}
+            </Text>,
+          )
+        }
+      }
+      return (
+        <Box flexDirection="column" paddingX={1}>
+          {rows}
+        </Box>
+      )
+    }
 
     const card = (title: string, ...children: unknown[]) => (
       <Box
@@ -548,28 +801,35 @@ export const register: Register = (on, options) => {
       )
     }
 
-    const mode = d
-      ? d.billing === 'subscription'
-        ? 'Pro/Max plan'
-        : d.billing === 'gateway'
-          ? 'Company gateway'
-          : 'API key'
-      : null
-
     return (
       <Box flexDirection="column" padding="sm">
         <Box flexDirection="row" justifyContent="space-between" alignItems="center" marginBottom="md">
           <Text size="footnote" dimColor>
             {mode ? `${mode} · ` : ''}
-            {s.isLoading
-              ? 'refreshing…'
-              : s.updatedAt
-                ? `updated ${new Date(s.updatedAt).toTimeString().slice(0, 5)}`
-                : 'loading…'}
+            {updated}
           </Text>
           <Button key="refresh" label="Refresh" variant="secondary" onPress={() => void refresh($, true)} />
         </Box>
         {blocks}
+      </Box>
+    )
+  })
+
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    if (e.props.hasSurvey) return next(e)
+    const d = await read($, data)
+    const l = await read($, live)
+    const limits = mergeLimits(d, l, Date.now())
+    const alert = attention(d, limits)
+    if (!alert || (await read($, bandHidden)) === alert.key) return next(e)
+    const { Box, Text, Button } = $.ui.resolve(e) as any
+    return (
+      <Box flexDirection="row" gap={1}>
+        <Text color={alert.color} wrap="truncate-end">
+          {`◆ Cost Guard: ${alert.text}`}
+        </Text>
+        <Button key="open" label="Details" onPress={() => void $.command.run({ command: 'cost-panel' })} />
+        <Button key="hide" label="Hide" onPress={() => void update($, bandHidden, () => alert.key)} />
       </Box>
     )
   })

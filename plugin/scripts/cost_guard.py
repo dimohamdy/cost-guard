@@ -430,13 +430,19 @@ def normalize_limits(raw):
     return out
 
 
-def record_limits(raw, source="statusline", now=None):
-    """Save the latest reading and append it to each window's samples. Returns the windows."""
+def record_limits(raw, source="statusline", now=None, session_id=None):
+    """Save the latest reading and append it to each window's samples. Returns the windows.
+    The session that reported it is remembered: billing is decided per session, because one
+    machine can run plan sessions (desktop app) beside API-key sessions (terminal)."""
     windows = normalize_limits(raw)
     if not windows:
         return None
     now = now or time.time()
     data = load_json(LIMITS_PATH, {})
+    if session_id:
+        seen = {sid: v for sid, v in (data.get("sessions") or {}).items() if now - v[0] < LIMIT_FRESH_S}
+        seen[session_id] = [now, sorted(windows)]
+        data["sessions"] = seen
     samples = data.get("samples") or {}
     for kind, w in windows.items():
         keep = [s for s in samples.get(kind, []) if s[2] == w["resets_at"]]  # this window instance only
@@ -456,14 +462,20 @@ def load_limits(now=None):
         return {}
     raw = data.get("windows") or {}
     live = {kind: w for kind, w in raw.items() if not w.get("resets_at") or w["resets_at"] > now}
-    return {"ts": data["ts"], "kinds": sorted(raw), "windows": live, "samples": data.get("samples") or {}}
+    return {"ts": data["ts"], "kinds": sorted(raw), "windows": live, "samples": data.get("samples") or {},
+            "sessions": data.get("sessions") or {}}
 
 
-def billing_mode(cfg, lim):
+def billing_mode(cfg, lim, session_id=None):
+    """auto: what this session's own readings say (a session that never reported plan or
+    spend limits is pay-per-token); with no session, what the latest reading says."""
     mode = cfg.get("billing", "auto")
     if mode != "auto":
         return mode
     kinds = set(lim.get("kinds") or [])
+    if session_id:
+        mine = (lim.get("sessions") or {}).get(session_id)
+        kinds = set(mine[1]) if mine else set()
     if "spend_limit" in kinds:
         return "gateway"
     if kinds & {"five_hour", "seven_day"}:
@@ -674,6 +686,8 @@ def cached_scan(days=MCP_USAGE_DAYS, deadline=None):
 
 def scan_in_background():
     """Fill the scan cache in a detached process, so a hook never waits for it."""
+    if os.environ.get("COST_GUARD_NO_BACKGROUND"):  # tests
+        return
     lock = os.path.join(STATE_DIR, "prescan.lock")
     try:
         if time.time() - os.path.getmtime(lock) < 600:
@@ -1226,7 +1240,9 @@ def check(data, cfg):
     block = warn = None
     where = f" (project limits for {cfg['project']})" if cfg.get("project") else ""
     lim = load_limits(now)
-    billing = billing_mode(cfg, lim)
+    billing = billing_mode(cfg, lim, sid)
+    if billing == "api":
+        lim = {}  # another session's plan limits say nothing about this one
     plan = billing == "subscription"  # no per-token bill: dollar caps inform, never stop
     if plan:
         caps = []
@@ -1398,11 +1414,13 @@ def run_statusline():
         return red if v >= cap * 0.8 else yellow if v >= cap * 0.4 else green
 
     try:
-        record_limits(data.get("rate_limits"), "statusline")
+        record_limits(data.get("rate_limits"), "statusline", session_id=data.get("session_id"))
     except Exception:
         log_error("record_limits")
     lim = load_limits()
-    billing = billing_mode(cfg, lim)
+    billing = billing_mode(cfg, lim, data.get("session_id"))
+    if billing == "api":
+        lim = {}
     now = time.time()
 
     def pct_color(p):
@@ -1837,7 +1855,10 @@ def panel_data(session_id=None, now=None):
     cfg = load_config(cwd)
     t = totals(cfg, path, deadline=now + 3)
     lim = load_limits(now)
-    billing = billing_mode(cfg, lim)
+    sid = os.path.basename(path)[:-6] if path and path.endswith(".jsonl") else None
+    billing = billing_mode(cfg, lim, sid)
+    if billing == "api":
+        lim = {}
     samples = lim.get("samples") or {}
     limits = []
     for kind in ("five_hour", "seven_day", "spend_limit"):
@@ -1887,11 +1908,11 @@ def panel_data(session_id=None, now=None):
     }
 
 
-def run_record_limits():
+def run_record_limits(session_id=None):
     raw = load_json_stdin()
     if isinstance(raw, dict) and "rate_limits" in raw:
         raw = raw["rate_limits"]
-    record_limits(raw, "desktop")
+    record_limits(raw, "desktop", session_id=session_id)
 
 
 # ---------- reversible fixes ----------
@@ -2172,7 +2193,7 @@ def main():
         elif mode == "panel-json":
             print(json.dumps(panel_data(arg_after("--session"))))
         elif mode == "record-limits":
-            run_record_limits()
+            run_record_limits(arg_after("--session"))
         elif mode == "insights":
             run_insights(int(arg_after("--days") or MCP_USAGE_DAYS))
         elif mode == "context":

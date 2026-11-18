@@ -54,6 +54,7 @@ declare module 'claude-code' {
       data: Shaped<PanelData | null>
       live: Shaped<Live>
       status: Shaped<Status>
+      bandHidden: Shaped<string>
     }
   }
 }
