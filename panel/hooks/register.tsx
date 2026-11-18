@@ -147,8 +147,8 @@ export function ringsSvg(rings: Ring[]): string {
 /** 14 days of spend: bars with a 2px gap, today in the accent, a dashed average line. */
 export function dayChart(days: { day: string; usd: number }[]): string {
   const w = 300
-  const h = 122
-  const top = 16
+  const h = 128
+  const top = 22
   const base = h - 20
   const max = Math.max(...days.map(d => d.usd), 0.01)
   const active = days.filter(d => d.usd > 0)
@@ -177,10 +177,14 @@ export function dayChart(days: { day: string; usd: number }[]): string {
       )
     })
     .join('')
+  // The average's label sits in a legend row above the bars, so a tall bar never covers it.
+  const avgText = `avg ${money(avg)}/day`
+  const legendX = w - avgText.length * 4.9 - 4
   const avgLine =
     avg > 0
       ? `<line class="avg" x1="0" x2="${w}" y1="${y(avg).toFixed(1)}" y2="${y(avg).toFixed(1)}" stroke-width="1" stroke-dasharray="3 3" opacity=".7"/>` +
-        `<text class="sub" x="${w}" y="${(y(avg) - 4).toFixed(1)}" font-size="9.5" text-anchor="end">avg ${money(avg)}/day</text>`
+        `<line class="avg" x1="${(legendX - 16).toFixed(1)}" x2="${(legendX - 4).toFixed(1)}" y1="7" y2="7" stroke-width="1" stroke-dasharray="3 3"/>` +
+        `<text class="sub" x="${w}" y="10.5" font-size="9.5" text-anchor="end">${avgText}</text>`
       : ''
   const axis = `<line class="grid" x1="0" x2="${w}" y1="${base + 0.5}" y2="${base + 0.5}" stroke-width="1"/>`
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}">${STYLE}${axis}${bars}${avgLine}</svg>`
